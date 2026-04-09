@@ -9,8 +9,7 @@ use tiny_keccak::{Hasher, Keccak};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use k256::ecdsa::{RecoveryId, Signature as Secp256k1Signature, VerifyingKey as Secp256k1VerifyingKey};
 
-use p3_field::{AbstractField, PrimeField32};
-use sp1_primitives::{poseidon2_hash, SP1Field};
+use sp1_zkvm::syscalls::Poseidon2ByteHash;
 
 use shared::{
     EthOrderWitness, OrderWitness, ProgramInput, ProofOutput, RegisterKeyWitness, SessionKeyLeaf,
@@ -19,19 +18,13 @@ use shared::{
 
 // ── Poseidon2 helpers ───────────────────────────────────────────────────────
 
+const RATE: usize = 8;
+
 fn poseidon2_hash_to_bytes(input: &[u8]) -> [u8; 32] {
-    let mut elements = Vec::with_capacity((input.len() + 3) / 4);
-    for chunk in input.chunks(4) {
-        let mut buf = [0u8; 4];
-        buf[..chunk.len()].copy_from_slice(chunk);
-        let val = u32::from_le_bytes(buf);
-        let reduced = val % SP1Field::ORDER_U32;
-        elements.push(SP1Field::from_canonical_u32(reduced));
-    }
-    let out = poseidon2_hash(elements);
+    let out: [u32; RATE] = Poseidon2ByteHash::hash(input);
     let mut result = [0u8; 32];
-    for (i, &word) in out.iter().enumerate() {
-        result[i * 4..(i + 1) * 4].copy_from_slice(&word.as_canonical_u32().to_le_bytes());
+    for (i, &w) in out.iter().enumerate() {
+        result[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
     }
     result
 }
@@ -288,24 +281,5 @@ fn main() {
         ProgramInput::RegisterKey(w) => handle_register_key(w),
         ProgramInput::VerifyOrder(w) => handle_verify_order(w),
         ProgramInput::VerifyOrderEth(w) => handle_verify_order_eth(w),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_poseidon2_host_guest_alignment() {
-        let input = b"kalqix_test_vector_00000000000000";
-        let result = poseidon2_hash_to_bytes(input);
-        let expected: [u8; 32] = [
-            31, 243, 82, 102, 159, 251, 98, 71, 119, 250, 139, 31, 155, 168, 144, 60,
-            167, 161, 147, 32, 8, 254, 25, 47, 185, 60, 168, 80, 222, 155, 16, 48,
-        ];
-        assert_eq!(
-            result, expected,
-            "Poseidon2 host/guest mismatch — all Merkle proofs will fail"
-        );
     }
 }

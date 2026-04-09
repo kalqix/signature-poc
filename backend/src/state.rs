@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use p3_field::{AbstractField, PrimeField32};
-use sp1_primitives::{poseidon2_hash, SP1Field};
+use p3_symmetric::Permutation;
+use sp1_primitives::{poseidon2_init, SP1Field};
 use tiny_keccak::{Hasher, Keccak};
 
 use shared::{SessionKey, SessionKeyLeaf};
@@ -9,37 +10,56 @@ use shared::{SessionKey, SessionKeyLeaf};
 const TREE_DEPTH: usize = 8;
 const NUM_LEAVES: usize = 1 << TREE_DEPTH; // 256
 
-/// Convert a byte slice to a vector of KoalaBear field elements.
-/// Each group of 4 bytes is read as a little-endian u32, then reduced mod p.
-/// Trailing bytes (< 4) are zero-padded on the right.
-fn bytes_to_field_elements(input: &[u8]) -> Vec<SP1Field> {
-    let mut elements = Vec::with_capacity((input.len() + 3) / 4);
-    for chunk in input.chunks(4) {
-        let mut buf = [0u8; 4];
-        buf[..chunk.len()].copy_from_slice(chunk);
-        let val = u32::from_le_bytes(buf);
-        // KoalaBear modulus is 2^31 - 2^24 + 1 = 0x7f000001.
-        // from_canonical_u32 requires val < p, so reduce first.
-        let reduced = val % SP1Field::ORDER_U32;
-        elements.push(SP1Field::from_canonical_u32(reduced));
+// ── Poseidon2 byte hash (matches sp1-lib Poseidon2ByteHash::hash) ──────────
+const RATE: usize = 8;
+const WIDTH: usize = 16;
+const BYTE_BLOCK_SIZE: usize = RATE * 3; // 24
+
+/// Absorb one 24-byte block: pack 3 bytes per field element, overwrite
+/// state[0..RATE], then permute.
+fn absorb_byte_block(state: &mut [SP1Field; WIDTH], block: &[u8; BYTE_BLOCK_SIZE]) {
+    for i in 0..RATE {
+        let s = 3 * i;
+        let val = block[s] as u32
+            | ((block[s + 1] as u32) << 8)
+            | ((block[s + 2] as u32) << 16);
+        state[i] = SP1Field::from_canonical_u32(val);
     }
-    elements
+    let perm = poseidon2_init();
+    perm.permute_mut(state);
 }
 
-/// Convert 8 KoalaBear field elements to [u8; 32] using little-endian packing.
-fn field_elements_to_bytes(elements: &[SP1Field; 8]) -> [u8; 32] {
+/// Poseidon2 byte hash matching Poseidon2ByteHash::hash from sp1-lib.
+/// Length-prefixed sponge, 3-bytes-per-element, 24-byte blocks.
+pub fn poseidon2_hash_bytes(input: &[u8]) -> [u8; 32] {
+    let mut state = [SP1Field::zero(); WIDTH];
+
+    // 1. Length prefix — absorb input.len() as first block.
+    let len_bytes = input.len().to_le_bytes();
+    let mut len_block = [0u8; BYTE_BLOCK_SIZE];
+    len_block[..len_bytes.len()].copy_from_slice(&len_bytes);
+    absorb_byte_block(&mut state, &len_block);
+
+    // 2. Full 24-byte blocks.
+    let chunks = input.chunks_exact(BYTE_BLOCK_SIZE);
+    let remainder = chunks.remainder();
+    for chunk in chunks {
+        absorb_byte_block(&mut state, chunk.try_into().unwrap());
+    }
+
+    // 3. Partial final block (zero-padded).
+    if !remainder.is_empty() {
+        let mut last = [0u8; BYTE_BLOCK_SIZE];
+        last[..remainder.len()].copy_from_slice(remainder);
+        absorb_byte_block(&mut state, &last);
+    }
+
+    // 4. Squeeze: first RATE state words → 32 bytes.
     let mut result = [0u8; 32];
-    for (i, el) in elements.iter().enumerate() {
-        let word = el.as_canonical_u32();
-        result[i * 4..(i + 1) * 4].copy_from_slice(&word.to_le_bytes());
+    for (i, el) in state[..RATE].iter().enumerate() {
+        result[i * 4..(i + 1) * 4].copy_from_slice(&el.as_canonical_u32().to_le_bytes());
     }
     result
-}
-
-pub fn poseidon2_hash_bytes(input: &[u8]) -> [u8; 32] {
-    let field_input = bytes_to_field_elements(input);
-    let output = poseidon2_hash(field_input);
-    field_elements_to_bytes(&output)
 }
 
 fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {

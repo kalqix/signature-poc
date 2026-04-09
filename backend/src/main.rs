@@ -161,13 +161,15 @@ async fn place_order(
             let report = &result.report;
             let total_instructions = report.total_instruction_count();
             let total_syscalls = report.total_syscall_count();
+            let sys_calls = report.syscall_counts.clone();
             println!(
-                "VERIFY_ORDER proof succeeded: account={} key_index={} | instructions={} syscalls={} gas={:?}",
+                "VERIFY_ORDER proof succeeded: account={} key_index={} | instructions={} syscalls={} gas={:?} sys_calls={:?}",
                 hex::encode(result.output.account_address),
                 result.output.key_index,
                 total_instructions,
                 total_syscalls,
                 report.gas(),
+                sys_calls
             );
             (
                 StatusCode::OK,
