@@ -29,7 +29,7 @@ Compiles the guest program to a RISC-V ELF. Must be run before the backend.
 
 ```
 cd backend
-cargo run --release
+cargo run --release --bin backend
 ```
 
 Axum server starts on `http://localhost:3001`.
