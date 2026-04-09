@@ -1,0 +1,17 @@
+[package]
+name = "program"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sp1-zkvm = { version = "6.0.2", features = ["verify"] }
+shared = { path = "../shared" }
+sha2 = "0.10"
+ed25519-dalek = "2.1"
+k256 = { version = "0.13", features = ["ecdsa"] }
+hex = "0.4"
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+sp1-primitives = "6.0.2"
+p3-field = "0.3.2-succinct"
