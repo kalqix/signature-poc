@@ -22,7 +22,7 @@ use shared::{
 use state::AppState;
 use witness::run_proof;
 
-const ELF: &[u8] = include_bytes!("../../program/elf/riscv32im-succinct-zkvm-elf");
+const ELF: &[u8] = include_bytes!("../../program/elf/riscv64im-succinct-zkvm-elf");
 
 #[derive(Clone)]
 struct ServerState {

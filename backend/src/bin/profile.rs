@@ -30,7 +30,7 @@ use shared::*;
 mod state;
 use state::AppState;
 
-const ELF: &[u8] = include_bytes!("../../../program/elf/riscv32im-succinct-zkvm-elf");
+const ELF: &[u8] = include_bytes!("../../../program/elf/riscv64im-succinct-zkvm-elf");
 
 fn keccak256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Keccak::v256();
