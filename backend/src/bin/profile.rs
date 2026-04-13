@@ -17,6 +17,7 @@ use std::env;
 use anyhow::Result;
 use ed25519_dalek::Signer;
 use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey as Secp256k1SigningKey};
+use p256::ecdsa::SigningKey as P256SigningKey;
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use tiny_keccak::{Hasher, Keccak};
@@ -69,6 +70,8 @@ struct TestFixtures {
     address: [u8; 20],
     ed_sk: ed25519_dalek::SigningKey,
     ed_pk: ed25519_dalek::VerifyingKey,
+    p256_sk: P256SigningKey,
+    p256_pk_hex: String,
 }
 
 impl TestFixtures {
@@ -77,7 +80,9 @@ impl TestFixtures {
         let address = eth_address_from_key(&eth_sk);
         let ed_sk = ed25519_dalek::SigningKey::generate(&mut OsRng);
         let ed_pk = ed_sk.verifying_key();
-        Self { eth_sk, address, ed_sk, ed_pk }
+        let p256_sk = P256SigningKey::random(&mut OsRng);
+        let p256_pk_hex = hex::encode(p256_sk.verifying_key().to_sec1_bytes());
+        Self { eth_sk, address, ed_sk, ed_pk, p256_sk, p256_pk_hex }
     }
 }
 
@@ -166,6 +171,29 @@ fn build_verify_order_eth_input(fix: &TestFixtures) -> ProgramInput {
     ProgramInput::VerifyOrderEth(EthOrderWitness { order })
 }
 
+fn build_verify_order_p256_input(fix: &TestFixtures) -> ProgramInput {
+    let order_msg = format!(
+        "ETH/USDC:BUY:2000000:100:{}",
+        hex::encode(fix.address)
+    );
+    let hash = Sha256::digest(order_msg.as_bytes());
+    let (sig, _): (p256::ecdsa::Signature, _) = fix.p256_sk.sign_prehash(&hash).expect("p256 sign failed");
+    let sig_hex = hex::encode(sig.to_bytes());
+
+    let order = P256SignedOrder {
+        account_address: fix.address,
+        key_index: 0,
+        market: "ETH/USDC".to_string(),
+        side: "BUY".to_string(),
+        price: 2000000,
+        quantity: 100,
+        p256_signature_hex: sig_hex,
+        p256_pubkey_hex: fix.p256_pk_hex.clone(),
+    };
+
+    ProgramInput::VerifyOrderP256(P256OrderWitness { order })
+}
+
 async fn run_and_report(label: &str, input: ProgramInput, elf: &[u8]) -> Result<()> {
     let client = ProverClient::builder().cpu().build().await;
 
@@ -229,6 +257,10 @@ async fn main() -> Result<()> {
             let input = build_verify_order_eth_input(&fix);
             run_and_report("VerifyOrderEth (secp256k1)", input, ELF).await?;
         }
+        Some("verify-order-p256") => {
+            let input = build_verify_order_p256_input(&fix);
+            run_and_report("VerifyOrderP256 (P-256)", input, ELF).await?;
+        }
         _ => {
             // Run all three
             let reg_input = build_register_key_input(&fix, &mut app);
@@ -240,8 +272,11 @@ async fn main() -> Result<()> {
             let eth_input = build_verify_order_eth_input(&fix);
             run_and_report("VerifyOrderEth (secp256k1)", eth_input, ELF).await?;
 
+            let p256_input = build_verify_order_p256_input(&fix);
+            run_and_report("VerifyOrderP256 (P-256)", p256_input, ELF).await?;
+
             println!("\n============================================================");
-            println!("  Done. Compare VerifyOrder vs VerifyOrderEth totals above.");
+            println!("  Done. Compare VerifyOrder vs VerifyOrderEth vs VerifyOrderP256 totals above.");
             println!("============================================================");
         }
     }

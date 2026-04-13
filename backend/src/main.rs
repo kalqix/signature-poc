@@ -16,13 +16,13 @@ use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
 use shared::{
-    EthOrderWitness, EthSignedOrder, OrderWitness, ProgramInput, RegisterKeyRequest,
-    RegisterKeyWitness, SessionKey, SignedOrder,
+    EthOrderWitness, EthSignedOrder, OrderWitness, P256OrderWitness, P256SignedOrder,
+    ProgramInput, RegisterKeyRequest, RegisterKeyWitness, SessionKey, SignedOrder,
 };
 use state::AppState;
 use witness::run_proof;
 
-const ELF: &[u8] = include_bytes!("../../program/elf/riscv64im-succinct-zkvm-elf");
+const ELF: &[u8] = include_bytes!("../../program/elf/signature-poc");
 
 #[derive(Clone)]
 struct ServerState {
@@ -48,6 +48,7 @@ async fn main() {
         .route("/register-key", post(register_key))
         .route("/place-order", post(place_order))
         .route("/place-order-eth", post(place_order_eth))
+        .route("/place-order-p256", post(place_order_p256))
         .route("/state", get(get_state))
         .layer(cors)
         .with_state(state);
@@ -238,6 +239,56 @@ async fn place_order_eth(
         }
         Err(e) => {
             eprintln!("VERIFY_ORDER_ETH proof failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("proof failed: {e}")})),
+            )
+        }
+    }
+}
+
+async fn place_order_p256(
+    State(state): State<ServerState>,
+    Json(order): Json<P256SignedOrder>,
+) -> impl IntoResponse {
+    let witness = P256OrderWitness {
+        order: order.clone(),
+    };
+    let input = ProgramInput::VerifyOrderP256(witness);
+
+    match run_proof(input, ELF, &state.prover).await {
+        Ok(result) => {
+            let report = &result.report;
+            let total_instructions = report.total_instruction_count();
+            let total_syscalls = report.total_syscall_count();
+            let sys_calls = report.syscall_counts.clone();
+            println!(
+                "VERIFY_ORDER_P256 proof succeeded: account={} key_index={} | instructions={} syscalls={} gas={:?} sys_call={:?}",
+                hex::encode(result.output.account_address),
+                result.output.key_index,
+                total_instructions,
+                total_syscalls,
+                report.gas(),
+                sys_calls
+            );
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "success": true,
+                    "proof_type": "VERIFY_ORDER_P256",
+                    "order": order,
+                    "execution_report": {
+                        "total_instructions": total_instructions,
+                        "total_syscalls": total_syscalls,
+                        "gas": report.gas(),
+                        "touched_memory_addresses": report.touched_memory_addresses,
+                        "exit_code": report.exit_code,
+                    }
+                })),
+            )
+        }
+        Err(e) => {
+            eprintln!("VERIFY_ORDER_P256 proof failed: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("proof failed: {e}")})),

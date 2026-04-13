@@ -22,3 +22,4 @@ rand = "0.8"
 sp1-primitives = "6.0.2"
 p3-field = "0.3.2-succinct"
 p3-symmetric = "0.3.2-succinct"
+p256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }

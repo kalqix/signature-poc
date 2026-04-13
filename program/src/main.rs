@@ -11,10 +11,28 @@ use k256::ecdsa::{RecoveryId, Signature as Secp256k1Signature, VerifyingKey as S
 
 use sp1_zkvm::syscalls::Poseidon2ByteHash;
 
+use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey, signature::hazmat::PrehashVerifier};
+
 use shared::{
-    EthOrderWitness, OrderWitness, ProgramInput, ProofOutput, RegisterKeyWitness, SessionKeyLeaf,
-    eth_order_message, order_message, register_key_message,
+    EthOrderWitness, OrderWitness, P256OrderWitness, ProgramInput, ProofOutput,
+    RegisterKeyWitness, SessionKeyLeaf,
+    eth_order_message, order_message, p256_order_message, register_key_message,
 };
+
+#[inline(always)]
+fn write_usize_ascii(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
+    if n == 0 {
+        buf[0] = b'0';
+        return &buf[..1];
+    }
+    let mut i = 20;
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    &buf[i..]
+}
 
 // ── Poseidon2 helpers ───────────────────────────────────────────────────────
 
@@ -110,6 +128,45 @@ fn eip191_hash(message: &str) -> [u8; 32] {
     data.extend_from_slice(prefix.as_bytes());
     data.extend_from_slice(message.as_bytes());
     keccak256(&data)
+}
+
+pub fn recover_eth_address_kalqix(
+    message_bytes: &[u8],
+    sig_bytes: &[u8; 65]
+) -> [u8; 20] {
+    // 1. Build EIP-191 digest (same as ethers.js hashMessage)
+    let mut hasher = Keccak::v256();
+    hasher.update(b"\x19Ethereum Signed Message:\n");
+    // Write message length as ASCII digits without heap allocation
+    let mut len_buf = [0u8; 20];
+    let len_str = write_usize_ascii(message_bytes.len(), &mut len_buf);
+    hasher.update(len_str);
+    hasher.update(message_bytes);
+    let mut digest = [0u8; 32];
+    hasher.finalize(&mut digest);
+
+    // 2. Parse signature components
+    let v = sig_bytes[64];
+    let recovery_id = if v >= 27 { v - 27 } else { v };
+
+    let sig = Secp256k1Signature::try_from(&sig_bytes[..64])
+        .expect("invalid secp256k1 signature");
+    let recid = RecoveryId::try_from(recovery_id)
+    .expect("invalid recovery id");
+
+    // 3. Recover public key
+    let verifying_key = Secp256k1VerifyingKey::recover_from_prehash(&digest, &sig, recid)
+    .expect("secp256k1 recovery failed");
+
+    // 4. Derive Ethereum address from recovered public key
+    let encoded_point = verifying_key.to_encoded_point(false);
+    let encoded_bytes = encoded_point.as_bytes();
+    // Remove the 0x04 prefix byte before hashing
+    let key_hash = keccak256(&encoded_bytes[1..]);
+    // Ethereum address is the last 20 bytes
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&key_hash[12..32]);
+    address
 }
 
 fn recover_eth_address(digest: &[u8; 32], sig_bytes: &[u8; 65]) -> [u8; 20] {
@@ -256,7 +313,10 @@ fn handle_verify_order_eth(w: EthOrderWitness) {
     // 2. Recover signer from secp256k1 signature
     println!("cycle-tracker-report-start: secp256k1_recover");
     let sig_bytes = decode_hex_65(&w.order.eth_signature_hex);
-    let recovered_address = recover_eth_address(&digest, &sig_bytes);
+    let recovered_address = recover_eth_address_kalqix(
+        message.as_bytes(), &sig_bytes
+    );
+    //let recovered_address = recover_eth_address(&digest, &sig_bytes);
     println!("cycle-tracker-report-end: secp256k1_recover");
     assert!(
         recovered_address == w.order.account_address,
@@ -273,6 +333,39 @@ fn handle_verify_order_eth(w: EthOrderWitness) {
     });
 }
 
+// ── Verify Order (P-256 ECDSA — benchmark path) ───────────────────────────
+
+fn handle_verify_order_p256(w: P256OrderWitness) {
+    // 1. Hash the order message with SHA-256
+    println!("cycle-tracker-report-start: p256_sha256_hash");
+    let message = p256_order_message(&w.order);
+    let digest = Sha256::digest(message.as_bytes());
+    println!("cycle-tracker-report-end: p256_sha256_hash");
+
+    // 2. Verify P-256 ECDSA signature
+    println!("cycle-tracker-report-start: p256_verify");
+    let pubkey_bytes = hex::decode(&w.order.p256_pubkey_hex).expect("invalid p256 pubkey hex");
+    let vk = P256VerifyingKey::from_sec1_bytes(&pubkey_bytes)
+        .expect("invalid P-256 public key");
+    let sig_bytes = hex::decode(&w.order.p256_signature_hex).expect("invalid p256 sig hex");
+    let sig = P256Signature::from_slice(&sig_bytes)
+        .expect("invalid P-256 signature");
+    assert!(
+        vk.verify_prehash(&digest, &sig).is_ok(),
+        "P-256 ECDSA signature invalid"
+    );
+    println!("cycle-tracker-report-end: p256_verify");
+
+    // 3. Commit output
+    sp1_zkvm::io::commit(&ProofOutput {
+        old_session_key_root: [0u8; 32],
+        new_session_key_root: [0u8; 32],
+        account_address: w.order.account_address,
+        key_index: w.order.key_index,
+        proof_type: "VERIFY_ORDER_P256".to_string(),
+    });
+}
+
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 fn main() {
@@ -281,5 +374,6 @@ fn main() {
         ProgramInput::RegisterKey(w) => handle_register_key(w),
         ProgramInput::VerifyOrder(w) => handle_verify_order(w),
         ProgramInput::VerifyOrderEth(w) => handle_verify_order_eth(w),
+        ProgramInput::VerifyOrderP256(w) => handle_verify_order_p256(w),
     }
 }

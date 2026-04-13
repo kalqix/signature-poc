@@ -81,6 +81,24 @@ pub enum ProgramInput {
     RegisterKey(RegisterKeyWitness),
     VerifyOrder(OrderWitness),
     VerifyOrderEth(EthOrderWitness),
+    VerifyOrderP256(P256OrderWitness),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct P256SignedOrder {
+    pub account_address: [u8; 20],
+    pub key_index: u8,
+    pub market: String,
+    pub side: String,
+    pub price: u64,
+    pub quantity: u64,
+    pub p256_signature_hex: String,
+    pub p256_pubkey_hex: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct P256OrderWitness {
+    pub order: P256SignedOrder,
 }
 
 pub fn order_message(order: &SignedOrder) -> Vec<u8> {
@@ -93,6 +111,14 @@ pub fn order_message(order: &SignedOrder) -> Vec<u8> {
 }
 
 pub fn eth_order_message(order: &EthSignedOrder) -> String {
+    let account_hex = hex::encode(order.account_address);
+    format!(
+        "{}:{}:{}:{}:{}",
+        order.market, order.side, order.price, order.quantity, account_hex
+    )
+}
+
+pub fn p256_order_message(order: &P256SignedOrder) -> String {
     let account_hex = hex::encode(order.account_address);
     format!(
         "{}:{}:{}:{}:{}",

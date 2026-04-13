@@ -13,3 +13,4 @@ hex = "0.4"
 bincode = "1"
 serde = { version = "1", features = ["derive"] }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
+p256 = { version = "0.13.2", features = ["ecdsa"] }

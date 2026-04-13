@@ -20,7 +20,7 @@ Zero-knowledge proof-of-concept for session key registration and order signing u
 
 ```
 cd program
-cargo prove build
+cargo prove build --elf-name signature-poc --output-directory elf
 ```
 
 Compiles the guest program to a RISC-V ELF. Must be run before the backend.
