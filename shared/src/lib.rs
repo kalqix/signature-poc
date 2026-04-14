@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub mod septic;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SessionKey {
     pub pubkey: [u8; 32],
@@ -77,11 +79,30 @@ pub struct EthOrderWitness {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BatchSepticWitness {
+    pub orders: Vec<septic::SepticBenchWitness>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BatchSepticOptWitness {
+    pub orders: Vec<septic::SepticBenchWitness>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BatchEthWitness {
+    pub orders: Vec<EthOrderWitness>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ProgramInput {
     RegisterKey(RegisterKeyWitness),
     VerifyOrder(OrderWitness),
     VerifyOrderEth(EthOrderWitness),
     VerifyOrderP256(P256OrderWitness),
+    VerifyOrderSeptic(septic::SepticBenchWitness),
+    BatchSeptic(BatchSepticWitness),
+    BatchSepticOpt(BatchSepticOptWitness),
+    BatchEth(BatchEthWitness),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

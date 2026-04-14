@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 sp1-zkvm = { version = "6.0.2", features = ["verify"] }
+sp1-lib = "6.0.2"
 shared = { path = "../shared" }
 sha2 = "0.10"
 ed25519-dalek = "2.1"
