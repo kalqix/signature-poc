@@ -89,6 +89,16 @@ pub struct BatchSepticOptWitness {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BatchSepticSingleWitness {
+    pub orders: Vec<septic::SepticBenchWitness>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BatchSepticVerifyWitness {
+    pub orders: Vec<septic::SepticBenchWitness>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct BatchEthWitness {
     pub orders: Vec<EthOrderWitness>,
 }
@@ -102,6 +112,9 @@ pub enum ProgramInput {
     VerifyOrderSeptic(septic::SepticBenchWitness),
     BatchSeptic(BatchSepticWitness),
     BatchSepticOpt(BatchSepticOptWitness),
+    BatchSepticSingle(BatchSepticSingleWitness),
+    BatchSepticOptSingle(BatchSepticOptWitness),
+    BatchSepticVerify(BatchSepticVerifyWitness),
     BatchEth(BatchEthWitness),
 }
 

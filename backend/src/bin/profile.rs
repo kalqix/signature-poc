@@ -377,6 +377,33 @@ fn build_batch_septic_opt_input(fix: &TestFixtures, count: usize) -> ProgramInpu
     }
 }
 
+fn build_batch_septic_single_input(fix: &TestFixtures, count: usize) -> ProgramInput {
+    match build_batch_septic_input(fix, count) {
+        ProgramInput::BatchSeptic(w) => {
+            ProgramInput::BatchSepticSingle(BatchSepticSingleWitness { orders: w.orders })
+        }
+        _ => unreachable!("build_batch_septic_input returned non-BatchSeptic variant"),
+    }
+}
+
+fn build_batch_septic_opt_single_input(fix: &TestFixtures, count: usize) -> ProgramInput {
+    match build_batch_septic_input(fix, count) {
+        ProgramInput::BatchSeptic(w) => {
+            ProgramInput::BatchSepticOptSingle(BatchSepticOptWitness { orders: w.orders })
+        }
+        _ => unreachable!("build_batch_septic_input returned non-BatchSeptic variant"),
+    }
+}
+
+fn build_batch_septic_verify_input(fix: &TestFixtures, count: usize) -> ProgramInput {
+    match build_batch_septic_input(fix, count) {
+        ProgramInput::BatchSeptic(w) => {
+            ProgramInput::BatchSepticVerify(BatchSepticVerifyWitness { orders: w.orders })
+        }
+        _ => unreachable!("build_batch_septic_input returned non-BatchSeptic variant"),
+    }
+}
+
 fn build_batch_eth_input(fix: &TestFixtures, count: usize) -> ProgramInput {
     let mut orders = Vec::with_capacity(count);
     for i in 0..count {
@@ -600,6 +627,33 @@ async fn main() -> Result<()> {
             println!("\nGenerating 2000 septic signatures for batch Schnorr (host-side)...");
             let input = build_batch_septic_opt_input(&fix, 2000);
             run_and_report("BatchSepticOpt (2000 batch Schnorr)", input, ELF).await?;
+        }
+        Some("batch-septic-single-10") => {
+            let input = build_batch_septic_single_input(&fix, 10);
+            run_and_report("BatchSepticSingle (10 naive/single-syscall)", input, ELF).await?;
+        }
+        Some("batch-septic-single-2000") => {
+            println!("\nGenerating 2000 septic signatures for naive single-syscall (host-side)...");
+            let input = build_batch_septic_single_input(&fix, 2000);
+            run_and_report("BatchSepticSingle (2000 naive/single-syscall)", input, ELF).await?;
+        }
+        Some("batch-septic-opt-single-10") => {
+            let input = build_batch_septic_opt_single_input(&fix, 10);
+            run_and_report("BatchSepticOptSingle (10 batch-Schnorr/single-syscall)", input, ELF).await?;
+        }
+        Some("batch-septic-opt-single-2000") => {
+            println!("\nGenerating 2000 septic signatures for batch Schnorr single-syscall (host-side)...");
+            let input = build_batch_septic_opt_single_input(&fix, 2000);
+            run_and_report("BatchSepticOptSingle (2000 batch-Schnorr/single-syscall)", input, ELF).await?;
+        }
+        Some("batch-septic-verify-10") => {
+            let input = build_batch_septic_verify_input(&fix, 10);
+            run_and_report("BatchSepticVerify (10 Shamir)", input, ELF).await?;
+        }
+        Some("batch-septic-verify-2000") => {
+            println!("\nGenerating 2000 septic signatures for Shamir verify (host-side)...");
+            let input = build_batch_septic_verify_input(&fix, 2000);
+            run_and_report("BatchSepticVerify (2000 Shamir)", input, ELF).await?;
         }
         Some("batch-eth-2000") => {
             println!("\nGenerating 2000 secp256k1 signatures (host-side)...");

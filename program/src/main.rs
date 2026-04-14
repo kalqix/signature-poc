@@ -14,9 +14,10 @@ use sp1_zkvm::syscalls::Poseidon2ByteHash;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey, signature::hazmat::PrehashVerifier};
 
 use shared::{
-    BatchEthWitness, BatchSepticOptWitness, BatchSepticWitness, EthOrderWitness, OrderWitness,
-    P256OrderWitness, ProgramInput, ProofOutput, RegisterKeyWitness, SessionKeyLeaf,
-    eth_order_message, order_message, p256_order_message, register_key_message,
+    BatchEthWitness, BatchSepticOptWitness, BatchSepticSingleWitness, BatchSepticVerifyWitness,
+    BatchSepticWitness, EthOrderWitness, OrderWitness, P256OrderWitness, ProgramInput,
+    ProofOutput, RegisterKeyWitness, SessionKeyLeaf, eth_order_message, order_message,
+    p256_order_message, register_key_message,
     septic::{SepticBenchWitness, GENERATOR_X, GENERATOR_Y, GROUP_ORDER, scalar_add},
 };
 
@@ -607,6 +608,209 @@ fn handle_batch_septic_opt(w: BatchSepticOptWitness) {
     });
 }
 
+// ── Batch Septic (single-syscall scalar mul, naive per-signature verify) ──
+
+fn handle_batch_septic_single(w: BatchSepticSingleWitness) {
+    let count = w.orders.len();
+    let g = sp1_lib::septic::SepticPoint::new(GENERATOR_X.0, GENERATOR_Y.0);
+
+    println!("cycle-tracker-report-start: batch_single_total");
+    for witness in &w.orders {
+        let r_point = sp1_lib::septic::SepticPoint::new(
+            witness.order.signature.r_x.0,
+            witness.order.signature.r_y.0,
+        );
+        let pubkey = sp1_lib::septic::SepticPoint::new(
+            witness.order.pubkey_x.0,
+            witness.order.pubkey_y.0,
+        );
+
+        // SEPTIC_SCALAR_MUL precompile: 1 syscall per scalar mul.
+        let s_g = g.scalar_mul_single(&witness.order.signature.s);
+        let e_a = pubkey.scalar_mul_single(&witness.challenge_e);
+        let check = s_g.add(&e_a);
+
+        assert!(
+            check.x() == r_point.x() && check.y() == r_point.y(),
+            "Schnorr verify failed in batch (single)"
+        );
+    }
+    println!("cycle-tracker-report-end: batch_single_total");
+
+    sp1_zkvm::io::commit(&ProofOutput {
+        old_session_key_root: [0u8; 32],
+        new_session_key_root: [0u8; 32],
+        account_address: [0u8; 20],
+        key_index: 0,
+        proof_type: format!("BATCH_SEPTIC_SINGLE_{}", count),
+    });
+}
+
+// ── Batch Septic Opt (single-syscall scalar mul, combined-equation Schnorr) ──
+
+fn handle_batch_septic_opt_single(w: BatchSepticOptWitness) {
+    let count = w.orders.len();
+    assert!(count > 0, "empty batch");
+
+    let g = sp1_lib::septic::SepticPoint::new(GENERATOR_X.0, GENERATOR_Y.0);
+
+    // Phase 1 — derive 128-bit α_i via Fiat-Shamir from the whole batch.
+    println!("cycle-tracker-report-start: batch_opt_single_commitment");
+    let mut hasher = Sha256::new();
+    for witness in &w.orders {
+        hasher.update(witness.order.signature.r_x.to_bytes());
+        hasher.update(witness.order.signature.r_y.to_bytes());
+        hasher.update(witness.order.pubkey_x.to_bytes());
+        hasher.update(witness.order.pubkey_y.to_bytes());
+        for limb in &witness.challenge_e {
+            hasher.update(limb.to_le_bytes());
+        }
+    }
+    let batch_commitment = hasher.finalize();
+
+    let mut alphas: Vec<[u32; 8]> = Vec::with_capacity(count);
+    for i in 0..count {
+        let mut h = Sha256::new();
+        h.update(batch_commitment);
+        h.update((i as u32).to_le_bytes());
+        let digest = h.finalize();
+        let mut alpha = [0u32; 8];
+        for j in 0..4 {
+            alpha[j] = u32::from_le_bytes([
+                digest[j * 4],
+                digest[j * 4 + 1],
+                digest[j * 4 + 2],
+                digest[j * 4 + 3],
+            ]);
+        }
+        // Top 4 limbs stay zero — α_i is a 128-bit weight.
+        alphas.push(alpha);
+    }
+    println!("cycle-tracker-report-end: batch_opt_single_commitment");
+
+    // Phase 2 — combine: s_combined = Σ α_i·s_i mod r, ae_i = α_i·e_i mod r.
+    println!("cycle-tracker-report-start: batch_opt_single_scalar_combine");
+    let mut s_combined = [0u32; 8];
+    let mut ae_scalars: Vec<[u32; 8]> = Vec::with_capacity(count);
+    for i in 0..count {
+        let alpha = &alphas[i];
+        let s_i = &w.orders[i].order.signature.s;
+        let e_i = &w.orders[i].challenge_e;
+
+        let as_i = scalar_mul_mod_r_fast(alpha, s_i);
+        s_combined = scalar_add(&s_combined, &as_i);
+
+        let ae_i = scalar_mul_mod_r_fast(alpha, e_i);
+        ae_scalars.push(ae_i);
+    }
+    println!("cycle-tracker-report-end: batch_opt_single_scalar_combine");
+
+    // Phase 3 — single 217-bit scalar mul on G via SEPTIC_SCALAR_MUL.
+    println!("cycle-tracker-report-start: batch_opt_single_s_times_G");
+    let lhs_g = g.scalar_mul_single(&s_combined);
+    println!("cycle-tracker-report-end: batch_opt_single_s_times_G");
+
+    // Phase 4 — Σ(ae_i · A_i) via SEPTIC_SCALAR_MUL precompile.
+    println!("cycle-tracker-report-start: batch_opt_single_ae_times_A");
+    let mut ae_a_sum = sp1_lib::septic::SepticPoint::new([0u32; 7], [0u32; 7]);
+    let mut ae_sum_initialized = false;
+    for i in 0..count {
+        let a_i = sp1_lib::septic::SepticPoint::new(
+            w.orders[i].order.pubkey_x.0,
+            w.orders[i].order.pubkey_y.0,
+        );
+        let term = a_i.scalar_mul_single(&ae_scalars[i]);
+        if !ae_sum_initialized {
+            ae_a_sum = term;
+            ae_sum_initialized = true;
+        } else {
+            ae_a_sum = ae_a_sum.add(&term);
+        }
+    }
+    println!("cycle-tracker-report-end: batch_opt_single_ae_times_A");
+
+    // Phase 5 — LHS = s_combined·G + Σ(ae_i · A_i).
+    println!("cycle-tracker-report-start: batch_opt_single_lhs_combine");
+    let lhs = lhs_g.add(&ae_a_sum);
+    println!("cycle-tracker-report-end: batch_opt_single_lhs_combine");
+
+    // Phase 6 — Σ(α_i · R_i) via SEPTIC_SCALAR_MUL. The full 8-limb α_i is
+    // passed even though only the low 128 bits are nonzero — the loop runs
+    // inside the executor regardless.
+    println!("cycle-tracker-report-start: batch_opt_single_alpha_times_R");
+    let mut rhs = sp1_lib::septic::SepticPoint::new([0u32; 7], [0u32; 7]);
+    let mut rhs_initialized = false;
+    for i in 0..count {
+        let r_i = sp1_lib::septic::SepticPoint::new(
+            w.orders[i].order.signature.r_x.0,
+            w.orders[i].order.signature.r_y.0,
+        );
+        let term = r_i.scalar_mul_single(&alphas[i]);
+        if !rhs_initialized {
+            rhs = term;
+            rhs_initialized = true;
+        } else {
+            rhs = rhs.add(&term);
+        }
+    }
+    println!("cycle-tracker-report-end: batch_opt_single_alpha_times_R");
+
+    // Phase 7 — single equality check covers all `count` signatures.
+    println!("cycle-tracker-report-start: batch_opt_single_final_check");
+    assert!(
+        lhs.x() == rhs.x() && lhs.y() == rhs.y(),
+        "Batch Schnorr verification failed (single)"
+    );
+    println!("cycle-tracker-report-end: batch_opt_single_final_check");
+
+    sp1_zkvm::io::commit(&ProofOutput {
+        old_session_key_root: [0u8; 32],
+        new_session_key_root: [0u8; 32],
+        account_address: [0u8; 20],
+        key_index: 0,
+        proof_type: format!("BATCH_SEPTIC_OPT_SINGLE_{}", count),
+    });
+}
+
+// ── Batch Septic Verify (SEPTIC_VERIFY precompile, Shamir's trick) ────────
+
+fn handle_batch_septic_verify(w: BatchSepticVerifyWitness) {
+    let count = w.orders.len();
+
+    println!("cycle-tracker-report-start: batch_verify_total");
+    for witness in &w.orders {
+        let r_point = sp1_lib::septic::SepticPoint::new(
+            witness.order.signature.r_x.0,
+            witness.order.signature.r_y.0,
+        );
+        let pubkey = sp1_lib::septic::SepticPoint::new(
+            witness.order.pubkey_x.0,
+            witness.order.pubkey_y.0,
+        );
+
+        // Single syscall: Shamir's trick computes s·G + e·A internally.
+        let result = sp1_lib::septic::schnorr_compute(
+            &pubkey,
+            &witness.order.signature.s,
+            &witness.challenge_e,
+        );
+
+        assert!(
+            result.x() == r_point.x() && result.y() == r_point.y(),
+            "Schnorr verify failed in batch (verify)"
+        );
+    }
+    println!("cycle-tracker-report-end: batch_verify_total");
+
+    sp1_zkvm::io::commit(&ProofOutput {
+        old_session_key_root: [0u8; 32],
+        new_session_key_root: [0u8; 32],
+        account_address: [0u8; 20],
+        key_index: 0,
+        proof_type: format!("BATCH_SEPTIC_VERIFY_{}", count),
+    });
+}
+
 // ── Batch Eth (secp256k1 EIP-191 ecrecover) ───────────────────────────────
 
 fn handle_batch_eth(w: BatchEthWitness) {
@@ -645,6 +849,9 @@ fn main() {
         ProgramInput::VerifyOrderSeptic(w) => handle_verify_order_septic(w),
         ProgramInput::BatchSeptic(w) => handle_batch_septic(w),
         ProgramInput::BatchSepticOpt(w) => handle_batch_septic_opt(w),
+        ProgramInput::BatchSepticSingle(w) => handle_batch_septic_single(w),
+        ProgramInput::BatchSepticOptSingle(w) => handle_batch_septic_opt_single(w),
+        ProgramInput::BatchSepticVerify(w) => handle_batch_septic_verify(w),
         ProgramInput::BatchEth(w) => handle_batch_eth(w),
     }
 }
