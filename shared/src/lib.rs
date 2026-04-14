@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub mod septic;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SessionKey {
     pub pubkey: [u8; 32],
@@ -77,10 +79,60 @@ pub struct EthOrderWitness {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BatchSepticWitness {
+    pub orders: Vec<septic::SepticBenchWitness>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BatchSepticOptWitness {
+    pub orders: Vec<septic::SepticBenchWitness>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BatchSepticSingleWitness {
+    pub orders: Vec<septic::SepticBenchWitness>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BatchSepticVerifyWitness {
+    pub orders: Vec<septic::SepticBenchWitness>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BatchEthWitness {
+    pub orders: Vec<EthOrderWitness>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ProgramInput {
     RegisterKey(RegisterKeyWitness),
     VerifyOrder(OrderWitness),
     VerifyOrderEth(EthOrderWitness),
+    VerifyOrderP256(P256OrderWitness),
+    VerifyOrderSeptic(septic::SepticBenchWitness),
+    BatchSeptic(BatchSepticWitness),
+    BatchSepticOpt(BatchSepticOptWitness),
+    BatchSepticSingle(BatchSepticSingleWitness),
+    BatchSepticOptSingle(BatchSepticOptWitness),
+    BatchSepticVerify(BatchSepticVerifyWitness),
+    BatchEth(BatchEthWitness),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct P256SignedOrder {
+    pub account_address: [u8; 20],
+    pub key_index: u8,
+    pub market: String,
+    pub side: String,
+    pub price: u64,
+    pub quantity: u64,
+    pub p256_signature_hex: String,
+    pub p256_pubkey_hex: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct P256OrderWitness {
+    pub order: P256SignedOrder,
 }
 
 pub fn order_message(order: &SignedOrder) -> Vec<u8> {
@@ -93,6 +145,14 @@ pub fn order_message(order: &SignedOrder) -> Vec<u8> {
 }
 
 pub fn eth_order_message(order: &EthSignedOrder) -> String {
+    let account_hex = hex::encode(order.account_address);
+    format!(
+        "{}:{}:{}:{}:{}",
+        order.market, order.side, order.price, order.quantity, account_hex
+    )
+}
+
+pub fn p256_order_message(order: &P256SignedOrder) -> String {
     let account_hex = hex::encode(order.account_address);
     format!(
         "{}:{}:{}:{}:{}",

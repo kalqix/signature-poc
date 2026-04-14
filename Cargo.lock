@@ -347,6 +347,10 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "k256",
+ "num-bigint 0.4.6",
+ "num-integer",
+ "num-traits",
+ "p256",
  "p3-field",
  "p3-symmetric",
  "rand 0.8.5",
@@ -408,26 +412,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "bindgen"
-version = "0.70.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f49d8fed880d473ea71efb9bf597651e77201bdd4893efe54c9e5d65ae04ce6f"
-dependencies = [
- "bitflags",
- "cexpr",
- "clang-sys",
- "itertools 0.13.0",
- "log",
- "prettyplease",
- "proc-macro2",
- "quote",
- "regex",
- "rustc-hash 1.1.0",
- "shlex",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -591,15 +575,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cexpr"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fac387a98bb7c37292057cffc56d62ecb629900026402633ae9160df93a8766"
-dependencies = [
- "nom",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -620,17 +595,6 @@ dependencies = [
  "iana-time-zone",
  "num-traits",
  "windows-link",
-]
-
-[[package]]
-name = "clang-sys"
-version = "1.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
-dependencies = [
- "glob",
- "libc",
- "libloading",
 ]
 
 [[package]]
@@ -1576,12 +1540,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
-name = "glob"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
-
-[[package]]
 name = "group"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2063,15 +2021,6 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
@@ -2156,16 +2105,6 @@ name = "libc"
 version = "0.2.184"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48f5d2a454e16a5ea0f4ced81bd44e4cfc7bd3a507b61887c99fd3538b28e4af"
-
-[[package]]
-name = "libloading"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
-dependencies = [
- "cfg-if",
- "windows-link",
-]
 
 [[package]]
 name = "libm"
@@ -2556,13 +2495,14 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 [[package]]
 name = "p256"
 version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
+source = "git+https://github.com/sp1-patches/elliptic-curves?tag=patch-p256-13.2-sp1-6.0.0#923794180d3d7716ba3eed94459d4b434f844090"
 dependencies = [
  "ecdsa 0.16.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "elliptic-curve",
+ "hex",
  "primeorder",
  "sha2",
+ "sp1-lib",
 ]
 
 [[package]]
@@ -3026,9 +2966,8 @@ dependencies = [
 
 [[package]]
 name = "primeorder"
-version = "0.13.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "353e1ca18966c16d9deb1c69278edbc5f194139612772bd9537af60ac231e1e6"
+version = "0.13.1"
+source = "git+https://github.com/sp1-patches/elliptic-curves?tag=patch-p256-13.2-sp1-6.0.0#923794180d3d7716ba3eed94459d4b434f844090"
 dependencies = [
  "elliptic-curve",
 ]
@@ -3091,9 +3030,11 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "k256",
+ "p256",
  "serde",
  "sha2",
  "shared",
+ "sp1-lib",
  "sp1-zkvm",
  "tiny-keccak",
 ]
@@ -3115,7 +3056,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "once_cell",
@@ -3135,7 +3076,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -3161,7 +3102,7 @@ dependencies = [
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
- "rustc-hash 2.1.2",
+ "rustc-hash",
  "rustls",
  "socket2 0.6.3",
  "thiserror 2.0.18",
@@ -3181,7 +3122,7 @@ dependencies = [
  "lru-slab",
  "rand 0.9.2",
  "ring",
- "rustc-hash 2.1.2",
+ "rustc-hash",
  "rustls",
  "rustls-pki-types",
  "slab",
@@ -3484,12 +3425,6 @@ name = "rustc-demangle"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b50b8869d9fc858ce7266cce0194bd74df58b9d0e3f6df3a9fc8eb470d95c09d"
-
-[[package]]
-name = "rustc-hash"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustc-hash"
@@ -3804,6 +3739,7 @@ dependencies = [
  "bincode",
  "ed25519-dalek",
  "hex",
+ "p256",
  "serde",
  "serde_json",
  "sha2",
@@ -3843,16 +3779,16 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slop-air"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "p3-air",
 ]
 
 [[package]]
 name = "slop-algebra"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "itertools 0.14.0",
  "p3-field",
@@ -3861,8 +3797,8 @@ dependencies = [
 
 [[package]]
 name = "slop-alloc"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "serde",
  "slop-algebra",
@@ -3871,8 +3807,8 @@ dependencies = [
 
 [[package]]
 name = "slop-baby-bear"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "lazy_static",
  "p3-baby-bear",
@@ -3885,8 +3821,8 @@ dependencies = [
 
 [[package]]
 name = "slop-basefold"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "derive-where",
  "itertools 0.14.0",
@@ -3907,8 +3843,8 @@ dependencies = [
 
 [[package]]
 name = "slop-basefold-prover"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "derive-where",
  "itertools 0.14.0",
@@ -3933,8 +3869,8 @@ dependencies = [
 
 [[package]]
 name = "slop-bn254"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "ff 0.13.1",
  "p3-bn254-fr",
@@ -3948,8 +3884,8 @@ dependencies = [
 
 [[package]]
 name = "slop-challenger"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "futures",
  "p3-challenger",
@@ -3960,8 +3896,8 @@ dependencies = [
 
 [[package]]
 name = "slop-commit"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "p3-commit",
  "serde",
@@ -3970,8 +3906,8 @@ dependencies = [
 
 [[package]]
 name = "slop-dft"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "p3-dft",
  "serde",
@@ -3983,16 +3919,16 @@ dependencies = [
 
 [[package]]
 name = "slop-fri"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "p3-fri",
 ]
 
 [[package]]
 name = "slop-futures"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "crossbeam",
  "futures",
@@ -4005,8 +3941,8 @@ dependencies = [
 
 [[package]]
 name = "slop-jagged"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "derive-where",
  "futures",
@@ -4038,16 +3974,16 @@ dependencies = [
 
 [[package]]
 name = "slop-keccak-air"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "p3-keccak-air",
 ]
 
 [[package]]
 name = "slop-koala-bear"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "lazy_static",
  "p3-koala-bear",
@@ -4060,24 +3996,24 @@ dependencies = [
 
 [[package]]
 name = "slop-matrix"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "p3-matrix",
 ]
 
 [[package]]
 name = "slop-maybe-rayon"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "p3-maybe-rayon",
 ]
 
 [[package]]
 name = "slop-merkle-tree"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "derive-where",
  "ff 0.13.1",
@@ -4103,8 +4039,8 @@ dependencies = [
 
 [[package]]
 name = "slop-multilinear"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "derive-where",
  "futures",
@@ -4123,24 +4059,24 @@ dependencies = [
 
 [[package]]
 name = "slop-poseidon2"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "p3-poseidon2",
 ]
 
 [[package]]
 name = "slop-primitives"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "slop-algebra",
 ]
 
 [[package]]
 name = "slop-stacked"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "derive-where",
  "futures",
@@ -4161,8 +4097,8 @@ dependencies = [
 
 [[package]]
 name = "slop-sumcheck"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "futures",
  "itertools 0.14.0",
@@ -4178,16 +4114,16 @@ dependencies = [
 
 [[package]]
 name = "slop-symmetric"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "p3-symmetric",
 ]
 
 [[package]]
 name = "slop-tensor"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "arrayvec",
  "derive-where",
@@ -4205,16 +4141,16 @@ dependencies = [
 
 [[package]]
 name = "slop-uni-stark"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "p3-uni-stark",
 ]
 
 [[package]]
 name = "slop-utils"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "p3-util",
  "tracing-forest",
@@ -4223,8 +4159,8 @@ dependencies = [
 
 [[package]]
 name = "slop-whir"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "derive-where",
  "futures",
@@ -4291,8 +4227,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-build"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "anyhow",
  "cargo_metadata",
@@ -4304,8 +4240,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-core-executor"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "bincode",
  "bytemuck",
@@ -4346,8 +4282,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-core-executor-runner"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -4367,8 +4303,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-core-executor-runner-binary"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "bincode",
  "crash-handler",
@@ -4381,8 +4317,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-core-machine"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "bincode",
  "cfg-if",
@@ -4428,8 +4364,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-curves"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "cfg-if",
  "dashu",
@@ -4448,8 +4384,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-derive"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4458,8 +4394,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-hypercube"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "arrayref",
  "deepsize2",
@@ -4505,8 +4441,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-jit"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "dynasmrt",
  "hashbrown 0.14.5",
@@ -4520,8 +4456,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-lib"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "bincode",
  "elliptic-curve",
@@ -4531,8 +4467,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-primitives"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "bincode",
  "blake3",
@@ -4554,8 +4490,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-prover"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "anyhow",
  "bincode",
@@ -4617,8 +4553,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-prover-types"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "anyhow",
  "async-scoped",
@@ -4637,8 +4573,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-recursion-circuit"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "bincode",
  "itertools 0.14.0",
@@ -4676,8 +4612,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-recursion-compiler"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "backtrace",
  "cfg-if",
@@ -4696,8 +4632,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-recursion-executor"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "backtrace",
  "cfg-if",
@@ -4719,12 +4655,11 @@ dependencies = [
 
 [[package]]
 name = "sp1-recursion-gnark-ffi"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "anyhow",
  "bincode",
- "bindgen",
  "cfg-if",
  "hex",
  "num-bigint 0.4.6",
@@ -4743,8 +4678,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-recursion-machine"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "itertools 0.14.0",
  "rand 0.8.5",
@@ -4765,8 +4700,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-sdk"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4782,16 +4717,6 @@ dependencies = [
  "num-bigint 0.4.6",
  "serde",
  "sha2",
- "slop-algebra",
- "slop-alloc",
- "slop-basefold",
- "slop-commit",
- "slop-jagged",
- "slop-merkle-tree",
- "slop-multilinear",
- "slop-stacked",
- "slop-sumcheck",
- "slop-tensor",
  "sp1-build",
  "sp1-core-executor",
  "sp1-core-executor-runner",
@@ -4801,7 +4726,6 @@ dependencies = [
  "sp1-prover",
  "sp1-prover-types",
  "sp1-recursion-executor",
- "sp1-recursion-gnark-ffi",
  "sp1-verifier",
  "strum",
  "tempfile",
@@ -4812,8 +4736,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-verifier"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "bincode",
  "blake3",
@@ -4838,8 +4762,8 @@ dependencies = [
 
 [[package]]
 name = "sp1-zkvm"
-version = "6.0.2"
-source = "git+https://github.com/succinctlabs/sp1?branch=main#d9c031d723f3d6e4386ed85eb5b2edc0c0a769e5"
+version = "6.1.0"
+source = "git+https://github.com/kalqix/sp1?branch=feat%2Fseptic-precompiles#c9dc63f842a714b6d6b144c683c84628a8a9fba7"
 dependencies = [
  "cfg-if",
  "critical-section",
