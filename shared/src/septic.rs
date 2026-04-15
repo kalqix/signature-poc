@@ -55,7 +55,7 @@ pub fn kb_inv(a: u32) -> u32 {
 
 // ─── Fp7 extension ──────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct Fp7(pub [u32; 7]);
 
 impl Fp7 {
@@ -249,7 +249,7 @@ pub const GROUP_ORDER: [u32; 8] = [
     0xcc910bb6, 0x7579fd9a, 0x01e4a5d4, 0x00000000,
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct SepticPoint {
     pub x: Fp7,
     pub y: Fp7,
@@ -509,14 +509,14 @@ pub fn scalar_mul_mod_r(a: &[u32; 8], b: &[u32; 8]) -> [u32; 8] {
 
 // ─── Schnorr types ──────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct SepticSchnorrSignature {
     pub r_x: Fp7,
     pub r_y: Fp7,
     pub s: [u32; 8],
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct SepticSchnorrOrder {
     pub account_address: [u8; 20],
     pub key_index: u8,
@@ -529,7 +529,7 @@ pub struct SepticSchnorrOrder {
     pub pubkey_y: Fp7,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct SepticBenchWitness {
     pub order: SepticSchnorrOrder,
     pub challenge_e: [u32; 8],

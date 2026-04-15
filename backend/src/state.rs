@@ -1,218 +1,152 @@
+//! Backend state — JMT-backed session-key store.
+//!
+//! Wraps a `MockTreeStore` keyed by `session_key_hash(address, key_index)`
+//! and hashed with `Poseidon2Hasher`. Both `register_key` and
+//! `get_key_proof` produce JMT proofs that the SP1 guest verifies via
+//! `SparseMerkleProof::verify_existence` / `verify_nonexistence`.
+
 use std::collections::HashMap;
+use std::marker::PhantomData;
 
-use p3_field::{AbstractField, PrimeField32};
-use p3_symmetric::Permutation;
-use sp1_primitives::{poseidon2_init, SP1Field};
-use tiny_keccak::{Hasher, Keccak};
+use jmt::mock::MockTreeStore;
+use jmt::proof::SparseMerkleProof;
+use jmt::{JellyfishMerkleTree, KeyHash};
 
-use shared::{SessionKey, SessionKeyLeaf};
+use shared::{
+    encode_session_key_leaf, session_key_hash, Poseidon2Hasher, SessionKey, SessionKeyLeaf,
+};
 
-const TREE_DEPTH: usize = 8;
-const NUM_LEAVES: usize = 1 << TREE_DEPTH; // 256
+type SessionKeyTree<'a> = JellyfishMerkleTree<'a, MockTreeStore, Poseidon2Hasher>;
 
-// ── Poseidon2 byte hash (matches sp1-lib Poseidon2ByteHash::hash) ──────────
-const RATE: usize = 8;
-const WIDTH: usize = 16;
-const BYTE_BLOCK_SIZE: usize = RATE * 3; // 24
+const EMPTY_ROOT: [u8; 32] = *b"SPARSE_MERKLE_PLACEHOLDER_HASH__";
 
-/// Absorb one 24-byte block: pack 3 bytes per field element, overwrite
-/// state[0..RATE], then permute.
-fn absorb_byte_block(state: &mut [SP1Field; WIDTH], block: &[u8; BYTE_BLOCK_SIZE]) {
-    for i in 0..RATE {
-        let s = 3 * i;
-        let val = block[s] as u32
-            | ((block[s + 1] as u32) << 8)
-            | ((block[s + 2] as u32) << 16);
-        state[i] = SP1Field::from_canonical_u32(val);
-    }
-    let perm = poseidon2_init();
-    perm.permute_mut(state);
+pub struct RegisterKeyResult {
+    pub old_root: [u8; 32],
+    pub new_root: [u8; 32],
+    pub old_proof: SparseMerkleProof<Poseidon2Hasher>,
+    /// `Some(leaf)` when rotating an existing key, `None` for a fresh slot.
+    pub old_leaf: Option<SessionKeyLeaf>,
 }
 
-/// Poseidon2 byte hash matching Poseidon2ByteHash::hash from sp1-lib.
-/// Length-prefixed sponge, 3-bytes-per-element, 24-byte blocks.
-pub fn poseidon2_hash_bytes(input: &[u8]) -> [u8; 32] {
-    let mut state = [SP1Field::zero(); WIDTH];
-
-    // 1. Length prefix — absorb input.len() as first block.
-    let len_bytes = input.len().to_le_bytes();
-    let mut len_block = [0u8; BYTE_BLOCK_SIZE];
-    len_block[..len_bytes.len()].copy_from_slice(&len_bytes);
-    absorb_byte_block(&mut state, &len_block);
-
-    // 2. Full 24-byte blocks.
-    let chunks = input.chunks_exact(BYTE_BLOCK_SIZE);
-    let remainder = chunks.remainder();
-    for chunk in chunks {
-        absorb_byte_block(&mut state, chunk.try_into().unwrap());
-    }
-
-    // 3. Partial final block (zero-padded).
-    if !remainder.is_empty() {
-        let mut last = [0u8; BYTE_BLOCK_SIZE];
-        last[..remainder.len()].copy_from_slice(remainder);
-        absorb_byte_block(&mut state, &last);
-    }
-
-    // 4. Squeeze: first RATE state words → 32 bytes.
-    let mut result = [0u8; 32];
-    for (i, el) in state[..RATE].iter().enumerate() {
-        result[i * 4..(i + 1) * 4].copy_from_slice(&el.as_canonical_u32().to_le_bytes());
-    }
-    result
-}
-
-fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut combined = Vec::with_capacity(64);
-    combined.extend_from_slice(left);
-    combined.extend_from_slice(right);
-    poseidon2_hash_bytes(&combined)
-}
-
-pub fn compute_root(leaves: &[[u8; 32]]) -> [u8; 32] {
-    assert_eq!(leaves.len(), NUM_LEAVES);
-    let mut current_level: Vec<[u8; 32]> = leaves.to_vec();
-    for _ in 0..TREE_DEPTH {
-        let mut next_level = Vec::with_capacity(current_level.len() / 2);
-        for pair in current_level.chunks_exact(2) {
-            next_level.push(hash_pair(&pair[0], &pair[1]));
-        }
-        current_level = next_level;
-    }
-    current_level[0]
-}
-
-pub fn get_siblings(leaves: &[[u8; 32]], leaf_index: u64) -> Vec<[u8; 32]> {
-    assert_eq!(leaves.len(), NUM_LEAVES);
-    let mut siblings = Vec::with_capacity(TREE_DEPTH);
-    let mut current_level: Vec<[u8; 32]> = leaves.to_vec();
-    let mut idx = leaf_index as usize;
-    for _ in 0..TREE_DEPTH {
-        let sibling_idx = idx ^ 1;
-        siblings.push(current_level[sibling_idx]);
-        let mut next_level = Vec::with_capacity(current_level.len() / 2);
-        for pair in current_level.chunks_exact(2) {
-            next_level.push(hash_pair(&pair[0], &pair[1]));
-        }
-        current_level = next_level;
-        idx /= 2;
-    }
-    siblings
-}
-
-#[allow(dead_code)]
-pub fn verify_proof(
-    leaf_hash: [u8; 32],
-    leaf_index: u64,
-    siblings: &[[u8; 32]],
-    root: [u8; 32],
-) -> bool {
-    let mut current = leaf_hash;
-    let mut idx = leaf_index;
-    for sibling in siblings {
-        current = if idx % 2 == 0 {
-            hash_pair(&current, sibling)
-        } else {
-            hash_pair(sibling, &current)
-        };
-        idx /= 2;
-    }
-    current == root
-}
-
-pub fn set_leaf(leaves: &mut Vec<[u8; 32]>, index: usize, leaf_hash: [u8; 32]) {
-    leaves[index] = leaf_hash;
-}
-
-fn leaf_index_for(address: &[u8; 20], key_index: u8) -> u64 {
-    let mut keccak = Keccak::v256();
-    keccak.update(address);
-    let mut hash = [0u8; 32];
-    keccak.finalize(&mut hash);
-    (hash[0] as u64 * 254 + key_index as u64) % 256
-}
-
-fn hash_leaf(
-    address: &[u8; 20],
-    key_index: u8,
-    pubkey_x: &[u32; 7],
-    pubkey_y: &[u32; 7],
-) -> [u8; 32] {
-    let leaf = SessionKeyLeaf {
-        account_address: *address,
-        key_index,
-        pubkey_x: *pubkey_x,
-        pubkey_y: *pubkey_y,
-    };
-    let encoded = bincode::serialize(&leaf).expect("bincode serialize");
-    poseidon2_hash_bytes(&encoded)
-}
-
-#[derive(Clone, Debug)]
-pub struct SessionKeyTree {
-    pub leaves: Vec<[u8; 32]>,
-}
-
-impl SessionKeyTree {
-    pub fn new() -> Self {
-        Self {
-            leaves: vec![[0u8; 32]; NUM_LEAVES],
-        }
-    }
+pub struct KeyProofResult {
+    pub key: SessionKey,
+    pub proof: SparseMerkleProof<Poseidon2Hasher>,
+    pub root: [u8; 32],
 }
 
 pub struct AppState {
-    pub session_key_tree: SessionKeyTree,
-    pub session_keys: HashMap<(String, u8), SessionKey>,
+    pub store: MockTreeStore,
+    /// JMT version. `0` means the tree is empty (no puts yet); `current_root`
+    /// is the JMT placeholder hash and `get_with_proof` would fail with
+    /// `MissingRootError`, so we hand back an empty proof in that case.
+    pub version: u64,
     pub current_root: [u8; 32],
+    pub session_keys: HashMap<(String, u8), SessionKey>,
 }
 
 impl AppState {
     pub fn new() -> Self {
-        let tree = SessionKeyTree::new();
-        let root = compute_root(&tree.leaves);
         Self {
-            session_key_tree: tree,
+            store: MockTreeStore::default(),
+            version: 0,
+            current_root: EMPTY_ROOT,
             session_keys: HashMap::new(),
-            current_root: root,
         }
     }
 
-    /// Register a key, returning (old_leaf_hash, old_root, new_root, siblings, leaf_index).
-    /// Siblings are captured *before* the leaf is updated (proving the old state).
+    /// Insert (or rotate) the given session key. Returns the JMT proof of
+    /// the *pre-insertion* state, the old leaf (if any), and the new root.
     pub fn register_key(
         &mut self,
         address: [u8; 20],
         key: SessionKey,
-    ) -> ([u8; 32], [u8; 32], [u8; 32], Vec<[u8; 32]>, u64) {
-        let idx = leaf_index_for(&address, key.key_index);
-        let old_leaf_hash = self.session_key_tree.leaves[idx as usize];
-        let old_root = self.current_root;
-        let siblings = get_siblings(&self.session_key_tree.leaves, idx);
+    ) -> Result<RegisterKeyResult, String> {
+        let key_hash_bytes = session_key_hash(&address, key.key_index);
+        let key_hash = KeyHash(key_hash_bytes);
 
-        let leaf_hash = hash_leaf(&address, key.key_index, &key.pubkey_x, &key.pubkey_y);
-        set_leaf(&mut self.session_key_tree.leaves, idx as usize, leaf_hash);
-        let new_root = compute_root(&self.session_key_tree.leaves);
-        self.current_root = new_root;
+        let old_root = self.current_root;
+
+        // 1. Capture proof of the OLD state (before insertion).
+        //    Empty tree (version 0) has no stored root node — construct an
+        //    empty non-inclusion proof against EMPTY_ROOT directly.
+        let (old_value, old_proof) = if self.version == 0 {
+            (None, empty_proof())
+        } else {
+            let tree: SessionKeyTree<'_> = JellyfishMerkleTree::new(&self.store);
+            tree.get_with_proof(key_hash, self.version)
+                .map_err(|e| format!("get_with_proof: {e}"))?
+        };
+
+        let old_leaf = match old_value {
+            Some(bytes) => Some(
+                bincode::deserialize::<SessionKeyLeaf>(&bytes)
+                    .map_err(|e| format!("decode old leaf: {e}"))?,
+            ),
+            None => None,
+        };
+
+        // 2. Build and insert the new leaf at version+1.
+        let new_leaf = SessionKeyLeaf {
+            account_address: address,
+            key_index: key.key_index,
+            pubkey_x: key.pubkey_x,
+            pubkey_y: key.pubkey_y,
+        };
+        let new_value = encode_session_key_leaf(&new_leaf);
+
+        let new_version = self.version + 1;
+        let (new_root, batch) = {
+            let tree: SessionKeyTree<'_> = JellyfishMerkleTree::new(&self.store);
+            tree.put_value_set(vec![(key_hash, Some(new_value))], new_version)
+                .map_err(|e| format!("put_value_set: {e}"))?
+        };
+
+        self.store
+            .write_tree_update_batch(batch)
+            .map_err(|e| format!("write batch: {e}"))?;
+
+        self.version = new_version;
+        self.current_root = new_root.0;
 
         let address_hex = hex::encode(address);
-        self.session_keys
-            .insert((address_hex, key.key_index), key);
+        self.session_keys.insert((address_hex, key.key_index), key);
 
-        (old_leaf_hash, old_root, new_root, siblings, idx)
+        Ok(RegisterKeyResult {
+            old_root,
+            new_root: new_root.0,
+            old_proof,
+            old_leaf,
+        })
     }
 
-    /// Look up a registered key and return its proof data.
+    /// JMT inclusion proof for a previously registered key.
     pub fn get_key_proof(
         &self,
         address: [u8; 20],
         key_index: u8,
-    ) -> Option<(SessionKey, Vec<[u8; 32]>, u64)> {
+    ) -> Option<KeyProofResult> {
         let address_hex = hex::encode(address);
         let key = self.session_keys.get(&(address_hex, key_index))?.clone();
-        let idx = leaf_index_for(&address, key_index);
-        let siblings = get_siblings(&self.session_key_tree.leaves, idx);
-        Some((key, siblings, idx))
+
+        let key_hash = KeyHash(session_key_hash(&address, key_index));
+        let tree: SessionKeyTree<'_> = JellyfishMerkleTree::new(&self.store);
+        let (_value, proof) = tree.get_with_proof(key_hash, self.version).ok()?;
+
+        Some(KeyProofResult {
+            key,
+            proof,
+            root: self.current_root,
+        })
+    }
+}
+
+/// JMT placeholder proof — empty siblings, no leaf. Verifies as
+/// non-inclusion against `EMPTY_ROOT` for any key.
+fn empty_proof() -> SparseMerkleProof<Poseidon2Hasher> {
+    SparseMerkleProof {
+        leaf: None,
+        siblings: Vec::new(),
+        phantom_hasher: PhantomData,
     }
 }
 
@@ -220,145 +154,134 @@ impl AppState {
 mod tests {
     use super::*;
 
-    #[test]
-    fn empty_tree_root_is_deterministic() {
-        let tree = SessionKeyTree::new();
-        let root1 = compute_root(&tree.leaves);
-        let root2 = compute_root(&tree.leaves);
-        assert_eq!(root1, root2);
-        assert_ne!(root1, [0u8; 32]);
+    fn fresh_key(idx: u8) -> SessionKey {
+        SessionKey {
+            pubkey_x: [idx as u32 + 1; 7],
+            pubkey_y: [idx as u32 + 2; 7],
+            key_index: idx,
+        }
     }
 
     #[test]
-    fn set_leaf_changes_root() {
-        let mut tree = SessionKeyTree::new();
-        let root_before = compute_root(&tree.leaves);
-        set_leaf(&mut tree.leaves, 0, [1u8; 32]);
-        let root_after = compute_root(&tree.leaves);
-        assert_ne!(root_before, root_after);
+    fn empty_tree_root_is_placeholder() {
+        let state = AppState::new();
+        assert_eq!(state.current_root, EMPTY_ROOT);
+        assert_eq!(state.version, 0);
     }
 
     #[test]
-    fn verify_proof_works() {
-        let mut leaves = vec![[0u8; 32]; NUM_LEAVES];
-        let leaf_hash = [42u8; 32];
-        let idx: u64 = 7;
-        set_leaf(&mut leaves, idx as usize, leaf_hash);
-        let root = compute_root(&leaves);
-        let siblings = get_siblings(&leaves, idx);
-        assert!(verify_proof(leaf_hash, idx, &siblings, root));
-        assert!(!verify_proof([99u8; 32], idx, &siblings, root));
-    }
-
-    #[test]
-    fn register_and_lookup() {
+    fn register_first_key_changes_root_and_verifies() {
         let mut state = AppState::new();
         let address = [0xAB; 20];
-        let key = SessionKey {
-            pubkey_x: [0x01; 7],
-            pubkey_y: [0x02; 7],
+        let key = fresh_key(0);
+
+        let result = state.register_key(address, key.clone()).expect("register");
+
+        assert_eq!(result.old_root, EMPTY_ROOT, "old root should be EMPTY_ROOT");
+        assert!(result.old_leaf.is_none(), "fresh slot has no old leaf");
+        assert_ne!(result.new_root, EMPTY_ROOT, "new root must differ");
+        assert_eq!(state.current_root, result.new_root);
+        assert_eq!(state.version, 1);
+
+        // The empty proof verifies non-existence against EMPTY_ROOT.
+        let key_hash = jmt::KeyHash(shared::session_key_hash(&address, 0));
+        result
+            .old_proof
+            .verify_nonexistence(jmt::RootHash(EMPTY_ROOT), key_hash)
+            .expect("empty proof should verify non-existence against EMPTY_ROOT");
+
+        // The current key proof verifies inclusion against the new root.
+        let proof = state.get_key_proof(address, 0).expect("registered key");
+        let leaf = SessionKeyLeaf {
+            account_address: address,
+            key_index: 0,
+            pubkey_x: key.pubkey_x,
+            pubkey_y: key.pubkey_y,
+        };
+        let leaf_value = encode_session_key_leaf(&leaf);
+        proof
+            .proof
+            .verify_existence(jmt::RootHash(proof.root), key_hash, leaf_value)
+            .expect("inclusion proof should verify");
+    }
+
+    #[test]
+    fn rotate_key_returns_old_leaf() {
+        let mut state = AppState::new();
+        let address = [0xCD; 20];
+        let first = fresh_key(0);
+        state.register_key(address, first.clone()).expect("first register");
+
+        let rotated = SessionKey {
+            pubkey_x: [99u32; 7],
+            pubkey_y: [88u32; 7],
             key_index: 0,
         };
-        let (old_leaf_hash, old_root, new_root, siblings, idx) = state.register_key(address, key.clone());
-        assert_ne!(old_root, new_root);
-        assert_eq!(old_leaf_hash, [0u8; 32]); // fresh slot
+        let result = state.register_key(address, rotated.clone()).expect("rotate");
 
-        assert!(verify_proof([0u8; 32], idx, &siblings, old_root));
+        let old_leaf = result.old_leaf.expect("rotation must surface old leaf");
+        assert_eq!(old_leaf.pubkey_x, first.pubkey_x);
+        assert_eq!(old_leaf.pubkey_y, first.pubkey_y);
 
-        let (found_key, new_siblings, found_idx) =
-            state.get_key_proof(address, 0).expect("key should exist");
-        assert_eq!(found_key.pubkey_x, key.pubkey_x);
-        assert_eq!(found_key.pubkey_y, key.pubkey_y);
-        assert_eq!(found_idx, idx);
-        let leaf_hash = hash_leaf(&address, 0, &found_key.pubkey_x, &found_key.pubkey_y);
-        assert!(verify_proof(leaf_hash, found_idx, &new_siblings, new_root));
+        // Old proof verifies inclusion of the OLD leaf against the OLD root.
+        let key_hash = jmt::KeyHash(shared::session_key_hash(&address, 0));
+        let old_value = encode_session_key_leaf(&old_leaf);
+        result
+            .old_proof
+            .verify_existence(jmt::RootHash(result.old_root), key_hash, old_value)
+            .expect("old leaf inclusion proof should verify against old root");
     }
 
     #[test]
-    fn test_poseidon2_parameters() {
-        let input = b"kalqix_test_vector_00000000000000";
-        let result1 = poseidon2_hash_bytes(input);
-        let result2 = poseidon2_hash_bytes(input);
-        assert_eq!(result1, result2, "must be deterministic");
-        assert_ne!(result1, [0u8; 32], "must be non-zero");
-        println!("poseidon2_hash test vector: {:?}", result1);
+    fn register_witness_bincodes_round_trip() {
+        use shared::{ProgramInput, RegisterKeyRequest, RegisterKeyWitness};
+
+        let mut state = AppState::new();
+        let address = [0xEE; 20];
+        let key = fresh_key(0);
+        let result = state.register_key(address, key.clone()).expect("register");
+
+        let witness = RegisterKeyWitness {
+            request: RegisterKeyRequest {
+                account_address: address,
+                key_index: 0,
+                pubkey_x: key.pubkey_x,
+                pubkey_y: key.pubkey_y,
+                eth_signature_hex: "00".repeat(65),
+            },
+            old_session_key_root: result.old_root,
+            new_session_key_root: result.new_root,
+            old_proof: result.old_proof,
+            old_leaf: result.old_leaf,
+        };
+        let input = ProgramInput::RegisterKey(witness);
+
+        let bytes = bincode::serialize(&input).expect("serialize");
+        let _round: ProgramInput = bincode::deserialize(&bytes).expect("deserialize");
     }
 
-    /// Verify host poseidon2 matches sp1-lib Poseidon2ByteHash by running
-    /// the guest sponge logic on the host using the same raw u32 operations.
     #[test]
-    fn test_poseidon2_host_vs_guest_sponge() {
-        use p3_symmetric::Permutation as _;
+    fn two_distinct_keys_independent_proofs() {
+        let mut state = AppState::new();
+        let addr_a = [0x11; 20];
+        let addr_b = [0x22; 20];
+        state.register_key(addr_a, fresh_key(0)).expect("a");
+        state.register_key(addr_b, fresh_key(0)).expect("b");
 
-        const R: usize = 8;
-        const W: usize = 16;
-        const BBS: usize = R * 3;
+        let proof_a = state.get_key_proof(addr_a, 0).expect("a registered");
+        let proof_b = state.get_key_proof(addr_b, 0).expect("b registered");
+        assert_eq!(proof_a.root, proof_b.root, "shared root after both inserts");
 
-        // "Guest-style" hash: raw u32 state, same sponge as Poseidon2ByteHash
-        fn guest_style_hash(input: &[u8]) -> [u8; 32] {
-            let perm = poseidon2_init();
-
-            let mut state = [SP1Field::zero(); W];
-
-            // Length prefix
-            let len_bytes = input.len().to_le_bytes();
-            let mut len_block = [0u8; BBS];
-            len_block[..len_bytes.len()].copy_from_slice(&len_bytes);
-            absorb_block_raw(&perm, &mut state, &len_block);
-
-            let chunks = input.chunks_exact(BBS);
-            let remainder = chunks.remainder();
-            for chunk in chunks {
-                absorb_block_raw(&perm, &mut state, chunk.try_into().unwrap());
-            }
-            if !remainder.is_empty() {
-                let mut last = [0u8; BBS];
-                last[..remainder.len()].copy_from_slice(remainder);
-                absorb_block_raw(&perm, &mut state, &last);
-            }
-
-            let mut result = [0u8; 32];
-            for (i, el) in state[..R].iter().enumerate() {
-                result[i * 4..(i + 1) * 4]
-                    .copy_from_slice(&el.as_canonical_u32().to_le_bytes());
-            }
-            result
-        }
-
-        fn absorb_block_raw(
-            perm: &sp1_primitives::SP1Perm,
-            state: &mut [SP1Field; W],
-            block: &[u8; BBS],
-        ) {
-            for i in 0..R {
-                let s = 3 * i;
-                let val = block[s] as u32
-                    | ((block[s + 1] as u32) << 8)
-                    | ((block[s + 2] as u32) << 16);
-                state[i] = SP1Field::from_canonical_u32(val);
-            }
-            perm.permute_mut(state);
-        }
-
-        // Test a few inputs
-        for input in [
-            b"hello".as_slice(),
-            b"kalqix_test_vector_00000000000000".as_slice(),
-            &[0u8; 64],
-            &[0xFF; 100],
-        ] {
-            let host_result = poseidon2_hash_bytes(input);
-            let guest_result = guest_style_hash(input);
-            assert_eq!(
-                host_result, guest_result,
-                "host vs guest mismatch for input len={}",
-                input.len()
-            );
-        }
-
-        // Also test empty input
-        let host_empty = poseidon2_hash_bytes(b"");
-        let guest_empty = guest_style_hash(b"");
-        assert_eq!(host_empty, guest_empty, "mismatch on empty input");
+        let key_a_hash = jmt::KeyHash(shared::session_key_hash(&addr_a, 0));
+        let leaf_a = encode_session_key_leaf(&SessionKeyLeaf {
+            account_address: addr_a,
+            key_index: 0,
+            pubkey_x: proof_a.key.pubkey_x,
+            pubkey_y: proof_a.key.pubkey_y,
+        });
+        proof_a
+            .proof
+            .verify_existence(jmt::RootHash(proof_a.root), key_a_hash, leaf_a)
+            .expect("a inclusion");
     }
 }

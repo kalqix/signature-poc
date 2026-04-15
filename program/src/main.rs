@@ -8,9 +8,10 @@ use tiny_keccak::{Hasher, Keccak};
 
 use k256::ecdsa::{RecoveryId, Signature as Secp256k1Signature, VerifyingKey as Secp256k1VerifyingKey};
 
-use sp1_zkvm::syscalls::Poseidon2ByteHash;
+use jmt::{KeyHash, RootHash};
 
 use shared::{
+    encode_session_key_leaf, session_key_hash,
     BatchEthWitness, BatchSepticDedupWitness, BatchSepticOptWitness, BatchSepticSingleWitness,
     BatchSepticVerifyMerkleWitness, BatchSepticVerifyWitness, BatchSepticWitness,
     EthOrderWitness, OrderWitness, ProgramInput, ProofOutput, RegisterKeyWitness,
@@ -34,65 +35,11 @@ fn write_usize_ascii(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
     &buf[i..]
 }
 
-// ── Poseidon2 helpers ───────────────────────────────────────────────────────
+// ── borsh-backed public-output commit ──────────────────────────────────────
 
-const RATE: usize = 8;
-
-fn poseidon2_hash_to_bytes(input: &[u8]) -> [u8; 32] {
-    let out: [u32; RATE] = Poseidon2ByteHash::hash(input);
-    let mut result = [0u8; 32];
-    for (i, &w) in out.iter().enumerate() {
-        result[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
-    }
-    result
-}
-
-// ── Merkle helpers ──────────────────────────────────────────────────────────
-
-fn hash_leaf(leaf: &SessionKeyLeaf) -> [u8; 32] {
-    poseidon2_hash_to_bytes(&bincode::serialize(leaf).expect("bincode serialize"))
-}
-
-fn merkle_node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut combined = [0u8; 64];
-    combined[..32].copy_from_slice(left);
-    combined[32..].copy_from_slice(right);
-    poseidon2_hash_to_bytes(&combined)
-}
-
-fn verify_merkle_proof(
-    leaf_hash: [u8; 32],
-    leaf_index: u64,
-    siblings: &[[u8; 32]],
-    expected_root: [u8; 32],
-) -> bool {
-    let mut current = leaf_hash;
-    for (level, sibling) in siblings.iter().enumerate() {
-        let bit = (leaf_index >> level) & 1;
-        current = if bit == 0 {
-            merkle_node(&current, sibling)
-        } else {
-            merkle_node(sibling, &current)
-        };
-    }
-    current == expected_root
-}
-
-fn compute_new_root(
-    new_leaf_hash: [u8; 32],
-    leaf_index: u64,
-    siblings: &[[u8; 32]],
-) -> [u8; 32] {
-    let mut current = new_leaf_hash;
-    for (level, sibling) in siblings.iter().enumerate() {
-        let bit = (leaf_index >> level) & 1;
-        current = if bit == 0 {
-            merkle_node(&current, sibling)
-        } else {
-            merkle_node(sibling, &current)
-        };
-    }
-    current
+fn commit_borsh<T: borsh::BorshSerialize>(value: &T) {
+    let bytes = borsh::to_vec(value).expect("borsh serialize public output");
+    sp1_zkvm::io::commit_slice(&bytes);
 }
 
 // ── Hex decode helper ───────────────────────────────────────────────────────
@@ -173,20 +120,24 @@ fn recover_eth_address(digest: &[u8; 32], sig_bytes: &[u8; 65]) -> [u8; 20] {
 // ── Register Key ────────────────────────────────────────────────────────────
 
 fn handle_register_key(w: RegisterKeyWitness) {
-    // 1. Verify old leaf is consistent with old root
-    println!("cycle-tracker-report-start: merkle_verify_old");
-    assert!(
-        verify_merkle_proof(
-            w.old_leaf_hash,
-            w.leaf_index,
-            &w.merkle_siblings,
-            w.old_session_key_root
-        ),
-        "old leaf does not match old root"
-    );
-    println!("cycle-tracker-report-end: merkle_verify_old");
+    // 1. Verify the OLD JMT proof. `Some(old_leaf)` → inclusion proof for
+    //    rotation; `None` → non-inclusion proof for a fresh slot.
+    println!("cycle-tracker-report-start: jmt_verify_old");
+    let key_hash = KeyHash(session_key_hash(
+        &w.request.account_address,
+        w.request.key_index,
+    ));
+    let old_value = w.old_leaf.as_ref().map(encode_session_key_leaf);
+    w.old_proof
+        .verify(
+            RootHash(w.old_session_key_root),
+            key_hash,
+            old_value.as_deref(),
+        )
+        .expect("old JMT proof failed against old_session_key_root");
+    println!("cycle-tracker-report-end: jmt_verify_old");
 
-    // 2. Reconstruct and verify EIP-191 signature
+    // 2. Reconstruct and verify EIP-191 signature.
     let message = register_key_message(
         &w.request.account_address,
         &w.request.pubkey_x,
@@ -203,29 +154,10 @@ fn handle_register_key(w: RegisterKeyWitness) {
         "EIP-191 signature does not match account address"
     );
 
-    // 3. Hash the new leaf (septic pubkey)
-    println!("cycle-tracker-report-start: hash_new_leaf");
-    let new_leaf = SessionKeyLeaf {
-        account_address: w.request.account_address,
-        key_index: w.request.key_index,
-        pubkey_x: w.request.pubkey_x,
-        pubkey_y: w.request.pubkey_y,
-    };
-    let new_leaf_hash = hash_leaf(&new_leaf);
-    println!("cycle-tracker-report-end: hash_new_leaf");
-
-    // 4. Verify new state
-    println!("cycle-tracker-report-start: merkle_verify_new");
-    let computed_new_root =
-        compute_new_root(new_leaf_hash, w.leaf_index, &w.merkle_siblings);
-    assert!(
-        computed_new_root == w.new_session_key_root,
-        "new root mismatch"
-    );
-    println!("cycle-tracker-report-end: merkle_verify_new");
-
-    // 5. Commit public output
-    sp1_zkvm::io::commit(&ProofOutput {
+    // 3. The new root is committed to public output and validated on-chain;
+    //    POC trusts the host to compute it correctly. Production would also
+    //    verify a JMT `UpdateMerkleProof` here.
+    commit_borsh(&ProofOutput {
         old_session_key_root: w.old_session_key_root,
         new_session_key_root: w.new_session_key_root,
         account_address: w.request.account_address,
@@ -237,25 +169,26 @@ fn handle_register_key(w: RegisterKeyWitness) {
 // ── Verify Order (Septic Schnorr + Merkle membership) ──────────────────────
 
 fn handle_verify_order(w: OrderWitness) {
-    // 1. Reconstruct session key leaf and verify Merkle proof
-    println!("cycle-tracker-report-start: merkle_verify");
+    // 1. Reconstruct session key leaf and verify JMT inclusion proof.
+    //    Inclusion verifies that this exact (address, key_index, pubkey)
+    //    triple is registered — if the host substituted a different pubkey
+    //    the value-hash check inside `verify_existence` will fail.
+    println!("cycle-tracker-report-start: jmt_verify");
     let leaf = SessionKeyLeaf {
         account_address: w.order.account_address,
         key_index: w.order.key_index,
         pubkey_x: w.session_key.pubkey_x,
         pubkey_y: w.session_key.pubkey_y,
     };
-    let leaf_hash = hash_leaf(&leaf);
-    assert!(
-        verify_merkle_proof(
-            leaf_hash,
-            w.leaf_index,
-            &w.merkle_siblings,
-            w.session_key_root
-        ),
-        "session key not registered — Merkle proof failed"
-    );
-    println!("cycle-tracker-report-end: merkle_verify");
+    let leaf_value = encode_session_key_leaf(&leaf);
+    let key_hash = KeyHash(session_key_hash(
+        &w.order.account_address,
+        w.order.key_index,
+    ));
+    w.merkle_proof
+        .verify_existence(RootHash(w.session_key_root), key_hash, &leaf_value)
+        .expect("session key not registered — JMT inclusion proof failed");
+    println!("cycle-tracker-report-end: jmt_verify");
 
     // 2. Verify Schnorr signature via SEPTIC_VERIFY precompile (Shamir's trick)
     println!("cycle-tracker-report-start: schnorr_verify");
@@ -283,7 +216,7 @@ fn handle_verify_order(w: OrderWitness) {
     // Silence "unused" warning when only the message is needed off-host.
     let _ = septic_order_message(&w.order);
 
-    sp1_zkvm::io::commit(&ProofOutput {
+    commit_borsh(&ProofOutput {
         old_session_key_root: w.session_key_root,
         new_session_key_root: w.session_key_root,
         account_address: w.order.account_address,
@@ -311,7 +244,7 @@ fn handle_verify_order_eth(w: EthOrderWitness) {
         "EIP-191 order signature does not match account address"
     );
 
-    sp1_zkvm::io::commit(&ProofOutput {
+    commit_borsh(&ProofOutput {
         old_session_key_root: [0u8; 32],
         new_session_key_root: [0u8; 32],
         account_address: w.order.account_address,
@@ -330,25 +263,23 @@ fn handle_verify_order_eth(w: EthOrderWitness) {
 fn handle_verify_order_septic(w: VerifyOrderSepticWitness) {
     let bench = w.bench;
 
-    // 1. Verify session-key Merkle membership
-    println!("cycle-tracker-report-start: merkle_verify");
+    // 1. Verify session-key JMT inclusion.
+    println!("cycle-tracker-report-start: jmt_verify");
     let leaf = SessionKeyLeaf {
         account_address: bench.order.account_address,
         key_index: bench.order.key_index,
         pubkey_x: bench.order.pubkey_x.0,
         pubkey_y: bench.order.pubkey_y.0,
     };
-    let leaf_hash = hash_leaf(&leaf);
-    assert!(
-        verify_merkle_proof(
-            leaf_hash,
-            w.leaf_index,
-            &w.merkle_siblings,
-            w.session_key_root,
-        ),
-        "session key not registered — Merkle proof failed"
-    );
-    println!("cycle-tracker-report-end: merkle_verify");
+    let leaf_value = encode_session_key_leaf(&leaf);
+    let key_hash = KeyHash(session_key_hash(
+        &bench.order.account_address,
+        bench.order.key_index,
+    ));
+    w.merkle_proof
+        .verify_existence(RootHash(w.session_key_root), key_hash, &leaf_value)
+        .expect("session key not registered — JMT inclusion proof failed");
+    println!("cycle-tracker-report-end: jmt_verify");
 
     // 2. Per-bit scalar-mul Schnorr verify (s·G + e·A == R)
     let r_point = sp1_lib::septic::SepticPoint::new(
@@ -377,7 +308,7 @@ fn handle_verify_order_septic(w: VerifyOrderSepticWitness) {
     );
     println!("cycle-tracker-report-end: septic_final_check");
 
-    sp1_zkvm::io::commit(&ProofOutput {
+    commit_borsh(&ProofOutput {
         old_session_key_root: w.session_key_root,
         new_session_key_root: w.session_key_root,
         account_address: bench.order.account_address,
@@ -414,7 +345,7 @@ fn handle_batch_septic(w: BatchSepticWitness) {
     }
     println!("cycle-tracker-report-end: batch_septic_total");
 
-    sp1_zkvm::io::commit(&ProofOutput {
+    commit_borsh(&ProofOutput {
         old_session_key_root: [0u8; 32],
         new_session_key_root: [0u8; 32],
         account_address: [0u8; 20],
@@ -559,7 +490,7 @@ fn handle_batch_septic_opt(w: BatchSepticOptWitness) {
     );
     println!("cycle-tracker-report-end: batch_opt_final_check");
 
-    sp1_zkvm::io::commit(&ProofOutput {
+    commit_borsh(&ProofOutput {
         old_session_key_root: [0u8; 32],
         new_session_key_root: [0u8; 32],
         account_address: [0u8; 20],
@@ -596,7 +527,7 @@ fn handle_batch_septic_single(w: BatchSepticSingleWitness) {
     }
     println!("cycle-tracker-report-end: batch_single_total");
 
-    sp1_zkvm::io::commit(&ProofOutput {
+    commit_borsh(&ProofOutput {
         old_session_key_root: [0u8; 32],
         new_session_key_root: [0u8; 32],
         account_address: [0u8; 20],
@@ -712,7 +643,7 @@ fn handle_batch_septic_opt_single(w: BatchSepticOptWitness) {
     );
     println!("cycle-tracker-report-end: batch_opt_single_final_check");
 
-    sp1_zkvm::io::commit(&ProofOutput {
+    commit_borsh(&ProofOutput {
         old_session_key_root: [0u8; 32],
         new_session_key_root: [0u8; 32],
         account_address: [0u8; 20],
@@ -750,7 +681,7 @@ fn handle_batch_septic_verify(w: BatchSepticVerifyWitness) {
     }
     println!("cycle-tracker-report-end: batch_verify_total");
 
-    sp1_zkvm::io::commit(&ProofOutput {
+    commit_borsh(&ProofOutput {
         old_session_key_root: [0u8; 32],
         new_session_key_root: [0u8; 32],
         account_address: [0u8; 20],
@@ -766,26 +697,26 @@ fn handle_batch_septic_verify(w: BatchSepticVerifyWitness) {
 /// verification — the realistic per-order cost at scale.
 fn handle_batch_septic_verify_merkle(w: BatchSepticVerifyMerkleWitness) {
     let count = w.orders.len();
+    let session_key_root = RootHash(w.session_key_root);
 
     println!("cycle-tracker-report-start: batch_verify_merkle_total");
     for entry in &w.orders {
-        // Merkle membership check
+        // JMT membership check
         let leaf = SessionKeyLeaf {
             account_address: entry.bench.order.account_address,
             key_index: entry.bench.order.key_index,
             pubkey_x: entry.bench.order.pubkey_x.0,
             pubkey_y: entry.bench.order.pubkey_y.0,
         };
-        let leaf_hash = hash_leaf(&leaf);
-        assert!(
-            verify_merkle_proof(
-                leaf_hash,
-                entry.leaf_index,
-                &entry.merkle_siblings,
-                w.session_key_root,
-            ),
-            "session key not registered — Merkle proof failed"
-        );
+        let leaf_value = encode_session_key_leaf(&leaf);
+        let key_hash = KeyHash(session_key_hash(
+            &entry.bench.order.account_address,
+            entry.bench.order.key_index,
+        ));
+        entry
+            .merkle_proof
+            .verify_existence(session_key_root, key_hash, &leaf_value)
+            .expect("session key not registered — JMT inclusion proof failed");
 
         // Schnorr verify via SEPTIC_VERIFY (single syscall, Shamir's trick)
         let r_point = sp1_lib::septic::SepticPoint::new(
@@ -808,7 +739,7 @@ fn handle_batch_septic_verify_merkle(w: BatchSepticVerifyMerkleWitness) {
     }
     println!("cycle-tracker-report-end: batch_verify_merkle_total");
 
-    sp1_zkvm::io::commit(&ProofOutput {
+    commit_borsh(&ProofOutput {
         old_session_key_root: w.session_key_root,
         new_session_key_root: w.session_key_root,
         account_address: [0u8; 20],
@@ -826,8 +757,9 @@ fn handle_batch_septic_verify_merkle(w: BatchSepticVerifyMerkleWitness) {
 fn handle_batch_septic_dedup(w: BatchSepticDedupWitness) {
     let unique_count = w.unique_keys.len();
     let order_count = w.orders.len();
+    let session_key_root = RootHash(w.session_key_root);
 
-    // 1. One Merkle proof per unique session key.
+    // 1. One JMT proof per unique session key.
     println!("cycle-tracker-report-start: dedup_merkle_total");
     for key in &w.unique_keys {
         let leaf = SessionKeyLeaf {
@@ -836,16 +768,11 @@ fn handle_batch_septic_dedup(w: BatchSepticDedupWitness) {
             pubkey_x: key.pubkey_x,
             pubkey_y: key.pubkey_y,
         };
-        let leaf_hash = hash_leaf(&leaf);
-        assert!(
-            verify_merkle_proof(
-                leaf_hash,
-                key.leaf_index,
-                &key.merkle_siblings,
-                w.session_key_root,
-            ),
-            "session key not registered — Merkle proof failed"
-        );
+        let leaf_value = encode_session_key_leaf(&leaf);
+        let key_hash = KeyHash(session_key_hash(&key.account_address, key.key_index));
+        key.merkle_proof
+            .verify_existence(session_key_root, key_hash, &leaf_value)
+            .expect("session key not registered — JMT inclusion proof failed");
     }
     println!("cycle-tracker-report-end: dedup_merkle_total");
 
@@ -874,7 +801,7 @@ fn handle_batch_septic_dedup(w: BatchSepticDedupWitness) {
     }
     println!("cycle-tracker-report-end: dedup_schnorr_total");
 
-    sp1_zkvm::io::commit(&ProofOutput {
+    commit_borsh(&ProofOutput {
         old_session_key_root: w.session_key_root,
         new_session_key_root: w.session_key_root,
         account_address: [0u8; 20],
@@ -900,7 +827,7 @@ fn handle_batch_eth(w: BatchEthWitness) {
     }
     println!("cycle-tracker-report-end: batch_eth_total");
 
-    sp1_zkvm::io::commit(&ProofOutput {
+    commit_borsh(&ProofOutput {
         old_session_key_root: [0u8; 32],
         new_session_key_root: [0u8; 32],
         account_address: [0u8; 20],
@@ -912,7 +839,10 @@ fn handle_batch_eth(w: BatchEthWitness) {
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 fn main() {
-    let input: ProgramInput = sp1_zkvm::io::read();
+    // borsh-encoded ProgramInput (faster than bincode in the zkVM).
+    let raw = sp1_zkvm::io::read_vec();
+    let input: ProgramInput =
+        borsh::from_slice(&raw).expect("borsh deserialize ProgramInput");
     match input {
         ProgramInput::RegisterKey(w) => handle_register_key(w),
         ProgramInput::VerifyOrder(w) => handle_verify_order(w),

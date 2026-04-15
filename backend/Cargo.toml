@@ -15,12 +15,11 @@ hex = "0.4"
 sha2 = "0.10"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 bincode = "1"
+borsh = { version = "1.3", features = ["derive"] }
 anyhow = "1"
 k256 = { version = "0.13", features = ["ecdsa"] }
 rand = "0.8"
-sp1-primitives = "6.0.2"
-p3-field = "0.3.2-succinct"
-p3-symmetric = "0.3.2-succinct"
 num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"
+jmt = { git = "https://github.com/kalqix/jmt", rev = "8112b48ad7d66789145e3dfd133924a632678100", default-features = false, features = ["std", "sha2", "mocks"] }

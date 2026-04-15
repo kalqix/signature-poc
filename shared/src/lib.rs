@@ -1,17 +1,22 @@
 use serde::{Deserialize, Serialize};
 
+use jmt::proof::SparseMerkleProof;
+
+pub mod poseidon2_hasher;
 pub mod septic;
+
+pub use poseidon2_hasher::{poseidon2_hash_bytes, Poseidon2Hasher};
 
 // ── Session Key (septic Schnorr) ────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct SessionKey {
     pub pubkey_x: [u32; 7],
     pub pubkey_y: [u32; 7],
     pub key_index: u8,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct SessionKeyLeaf {
     pub account_address: [u8; 20],
     pub key_index: u8,
@@ -19,9 +24,23 @@ pub struct SessionKeyLeaf {
     pub pubkey_y: [u32; 7],
 }
 
-// ── Key Registration (secp256k1 EIP-191 + Merkle insert) ────────────────────
+/// Canonical bincoded leaf bytes — used as the JMT value at this key.
+pub fn encode_session_key_leaf(leaf: &SessionKeyLeaf) -> Vec<u8> {
+    bincode::serialize(leaf).expect("bincode serialize")
+}
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/// JMT key hash for a session key slot. Same Poseidon2 byte hash on
+/// host and guest, so backend and circuit address the same tree slot.
+pub fn session_key_hash(address: &[u8; 20], key_index: u8) -> [u8; 32] {
+    let mut input = [0u8; 21];
+    input[..20].copy_from_slice(address);
+    input[20] = key_index;
+    poseidon2_hash_bytes(&input)
+}
+
+// ── Key Registration (secp256k1 EIP-191 + JMT insert) ──────────────────────
+
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct RegisterKeyRequest {
     pub account_address: [u8; 20],
     pub key_index: u8,
@@ -30,19 +49,21 @@ pub struct RegisterKeyRequest {
     pub eth_signature_hex: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct RegisterKeyWitness {
     pub request: RegisterKeyRequest,
-    pub old_leaf_hash: [u8; 32],
     pub old_session_key_root: [u8; 32],
     pub new_session_key_root: [u8; 32],
-    pub merkle_siblings: Vec<[u8; 32]>,
-    pub leaf_index: u64,
+    /// Proof of the (key_hash) state under `old_session_key_root` —
+    /// non-existence for fresh registration, existence for rotation.
+    pub old_proof: SparseMerkleProof<Poseidon2Hasher>,
+    /// `Some(old_leaf)` for rotation, `None` for fresh registration.
+    pub old_leaf: Option<SessionKeyLeaf>,
 }
 
-// ── Septic Schnorr Order (with Merkle proof) ────────────────────────────────
+// ── Septic Schnorr Order (with JMT membership proof) ───────────────────────
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct SignedOrder {
     pub account_address: [u8; 20],
     pub key_index: u8,
@@ -56,18 +77,17 @@ pub struct SignedOrder {
     pub challenge_e: [u32; 8],
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct OrderWitness {
     pub order: SignedOrder,
     pub session_key: SessionKey,
     pub session_key_root: [u8; 32],
-    pub merkle_siblings: Vec<[u8; 32]>,
-    pub leaf_index: u64,
+    pub merkle_proof: SparseMerkleProof<Poseidon2Hasher>,
 }
 
 // ── Ethereum secp256k1 Order (benchmark comparison path, no Merkle) ─────────
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct EthSignedOrder {
     pub account_address: [u8; 20],
     pub key_index: u8,
@@ -78,7 +98,7 @@ pub struct EthSignedOrder {
     pub eth_signature_hex: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct EthOrderWitness {
     pub order: EthSignedOrder,
 }
@@ -89,71 +109,68 @@ pub struct EthOrderWitness {
 /// path (Merkle membership + per-order Schnorr) but uses per-bit `scalar_mul`
 /// syscalls instead of the `SEPTIC_VERIFY` precompile. Lets us isolate the
 /// precompile's win while holding the Merkle overhead constant.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct VerifyOrderSepticWitness {
     pub bench: septic::SepticBenchWitness,
     pub session_key_root: [u8; 32],
-    pub merkle_siblings: Vec<[u8; 32]>,
-    pub leaf_index: u64,
+    pub merkle_proof: SparseMerkleProof<Poseidon2Hasher>,
 }
 
 // ── Batch witnesses (benchmark profiling) ──────────────────────────────────
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct BatchSepticWitness {
     pub orders: Vec<septic::SepticBenchWitness>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct BatchSepticOptWitness {
     pub orders: Vec<septic::SepticBenchWitness>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct BatchSepticSingleWitness {
     pub orders: Vec<septic::SepticBenchWitness>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct BatchSepticVerifyWitness {
     pub orders: Vec<septic::SepticBenchWitness>,
 }
 
-/// One order in a Merkle-checked batch: Schnorr witness + per-order Merkle
-/// proof data. The tree root is shared across the batch and lives on the
-/// outer `BatchSepticVerifyMerkleWitness`.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/// One order in a Merkle-checked batch: Schnorr witness + per-order JMT
+/// membership proof. The tree root is shared across the batch and lives on
+/// the outer `BatchSepticVerifyMerkleWitness`.
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct SepticMerkleOrder {
     pub bench: septic::SepticBenchWitness,
-    pub merkle_siblings: Vec<[u8; 32]>,
-    pub leaf_index: u64,
+    pub merkle_proof: SparseMerkleProof<Poseidon2Hasher>,
 }
 
 /// Production-shaped batch Schnorr verify: per-order Merkle membership +
 /// `SEPTIC_VERIFY` precompile. Cycle cost is the realistic per-order cost
 /// for batched Schnorr in kalqix-zk-service.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct BatchSepticVerifyMerkleWitness {
     pub orders: Vec<SepticMerkleOrder>,
     pub session_key_root: [u8; 32],
 }
 
-/// One unique session key in a deduped batch — Merkle proof verified once
+/// One unique session key in a deduped batch — JMT proof verified once
 /// no matter how many orders reference it.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct DedupKey {
     pub account_address: [u8; 20],
     pub key_index: u8,
     pub pubkey_x: [u32; 7],
     pub pubkey_y: [u32; 7],
-    pub merkle_siblings: Vec<[u8; 32]>,
-    pub leaf_index: u64,
+    pub merkle_proof: SparseMerkleProof<Poseidon2Hasher>,
 }
 
 /// One signed order in a deduped batch. Schnorr verifies per-order; the
 /// pubkey comes from `unique_keys[key_idx]` so the same Merkle-verified key
 /// can authorize many orders.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct DedupOrder {
     pub key_idx: u32,
     pub market: String,
@@ -167,23 +184,23 @@ pub struct DedupOrder {
 }
 
 /// Realistic batch where one trader posts many orders: each unique
-/// (account_address, key_index) is Merkle-verified once, but every order
+/// (account_address, key_index) is JMT-verified once, but every order
 /// goes through SEPTIC_VERIFY independently.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct BatchSepticDedupWitness {
     pub unique_keys: Vec<DedupKey>,
     pub orders: Vec<DedupOrder>,
     pub session_key_root: [u8; 32],
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct BatchEthWitness {
     pub orders: Vec<EthOrderWitness>,
 }
 
 // ── Proof Output ────────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct ProofOutput {
     pub old_session_key_root: [u8; 32],
     pub new_session_key_root: [u8; 32],
@@ -194,7 +211,7 @@ pub struct ProofOutput {
 
 // ── Program Input ───────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub enum ProgramInput {
     RegisterKey(RegisterKeyWitness),
     VerifyOrder(OrderWitness),
@@ -295,5 +312,16 @@ mod tests {
         let msg = register_key_message(&address, &pubkey_x, &pubkey_y, 3);
         let expected = "Register KalqiX Session Key\n\npubkey: 0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c\naccount: 0xabcdef0123456789abcdef0123456789abcdef01\nkey index: 3\nOnly sign this message for a trusted client!";
         assert_eq!(msg, expected);
+    }
+
+    #[test]
+    fn session_key_hash_is_deterministic() {
+        let addr = [0xAB; 20];
+        let h1 = session_key_hash(&addr, 0);
+        let h2 = session_key_hash(&addr, 0);
+        let h3 = session_key_hash(&addr, 1);
+        assert_eq!(h1, h2);
+        assert_ne!(h1, h3);
+        assert_ne!(h1, [0u8; 32]);
     }
 }
