@@ -11,6 +11,13 @@ use jmt::SimpleHasher;
 /// Buffer-then-hash adapter for Poseidon2. JMT calls `update` several
 /// times per node hash (domain separator + key + value); we accumulate
 /// all bytes and call the underlying one-shot hasher in `finalize`.
+///
+/// `Clone + Debug` are required because `BatchExistenceProof<H>` derives
+/// them (unlike `SparseMerkleProof<H>` which has manual impls). Our
+/// witnesses embed `BatchExistenceProof<Poseidon2Hasher>`, so the
+/// derives need `Poseidon2Hasher: Clone + Debug` even though only the
+/// `PhantomData<H>` marker ever lives inside an actual proof value.
+#[derive(Clone, Debug)]
 pub struct Poseidon2Hasher {
     buffer: Vec<u8>,
 }

@@ -549,6 +549,153 @@ fn build_batch_septic_dedup_input(
     })
 }
 
+/// Same shape as `build_batch_septic_dedup_input`, but emits a
+/// `BatchSepticDedupBatchWitness` that wraps all unique-key proofs in
+/// a single `BatchExistenceProof`. Tree construction and order
+/// distribution are identical, so cycle-count deltas against the
+/// non-batch builder isolate the `BatchExistenceProof::verify` win.
+fn build_batch_septic_dedup_batch_input(
+    count: usize,
+    unique_count: usize,
+    tree_size: usize,
+) -> ProgramInput {
+    use jmt::mock::MockTreeStore;
+    use jmt::{build_batch_existence_proof, JellyfishMerkleTree, KeyHash};
+    use rand::seq::SliceRandom;
+    use rand::Rng;
+    use shared::{
+        encode_session_key_leaf, session_key_hash, BatchSepticDedupBatchWitness, Poseidon2Hasher,
+        UniqueKeyInfo,
+    };
+
+    assert!(unique_count >= 1, "unique_count must be >= 1");
+    assert!(
+        unique_count <= tree_size,
+        "unique_count ({}) must be <= tree_size ({})",
+        unique_count,
+        tree_size
+    );
+
+    println!(
+        "  DedupBatch config: {} orders, {} unique in batch, {} keys in JMT (depth ~{})",
+        count,
+        unique_count,
+        tree_size,
+        ((tree_size as f64).log2().ceil() as usize).max(0),
+    );
+
+    // 1. Generate `tree_size` session pairs + addresses + JMT leaves.
+    let mut session_pairs: Vec<(SessionPair, [u8; 20], u8)> = Vec::with_capacity(tree_size);
+    let mut value_set: Vec<(KeyHash, Option<Vec<u8>>)> = Vec::with_capacity(tree_size);
+
+    for i in 0..tree_size {
+        let session = make_session_pair();
+        let mut address = [0u8; 20];
+        address[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        let key_index = 0u8;
+
+        let leaf = SessionKeyLeaf {
+            account_address: address,
+            key_index,
+            pubkey_x: session.pubkey.x.0,
+            pubkey_y: session.pubkey.y.0,
+        };
+        let leaf_value = encode_session_key_leaf(&leaf);
+        let key_hash = KeyHash(session_key_hash(&address, key_index));
+        value_set.push((key_hash, Some(leaf_value)));
+
+        session_pairs.push((session, address, key_index));
+
+        if tree_size >= 500 && (i + 1) % 500 == 0 {
+            println!("  generated {}/{} keys for JMT", i + 1, tree_size);
+        }
+    }
+
+    // 2. Insert all keys at version 1.
+    let store = MockTreeStore::default();
+    let (root, batch_update) = {
+        let tree: JellyfishMerkleTree<MockTreeStore, Poseidon2Hasher> =
+            JellyfishMerkleTree::new(&store);
+        tree.put_value_set(value_set, 1)
+            .expect("dedup-batch put_value_set")
+    };
+    store
+        .write_tree_update_batch(batch_update)
+        .expect("dedup-batch write_tree_update_batch");
+
+    // 3. Pull individual inclusion proofs for the first `unique_count` keys,
+    //    then fold them into a BatchExistenceProof.
+    let tree: JellyfishMerkleTree<MockTreeStore, Poseidon2Hasher> =
+        JellyfishMerkleTree::new(&store);
+    let mut proof_entries: Vec<(
+        KeyHash,
+        Vec<u8>,
+        jmt::proof::SparseMerkleProof<Poseidon2Hasher>,
+    )> = Vec::with_capacity(unique_count);
+    let mut key_infos: Vec<UniqueKeyInfo> = Vec::with_capacity(unique_count);
+
+    for (session, address, key_index) in session_pairs.iter().take(unique_count) {
+        let key_hash = KeyHash(session_key_hash(address, *key_index));
+        let (value_opt, proof) = tree
+            .get_with_proof(key_hash, 1)
+            .expect("dedup-batch get_with_proof");
+        let value = value_opt.expect("key was just inserted, should exist");
+        proof_entries.push((key_hash, value, proof));
+        key_infos.push(UniqueKeyInfo {
+            account_address: *address,
+            key_index: *key_index,
+            pubkey_x: session.pubkey.x.0,
+            pubkey_y: session.pubkey.y.0,
+        });
+    }
+
+    let batch_proof = build_batch_existence_proof(proof_entries);
+
+    // 4. Same order-distribution logic as the non-batch dedup builder.
+    let mut rng = rand::rngs::OsRng;
+    let mut orders = Vec::with_capacity(count);
+    for i in 0..count {
+        let key_idx: usize = if i < unique_count {
+            i
+        } else {
+            rng.gen_range(0..unique_count)
+        };
+        let (session, address, _key_index) = &session_pairs[key_idx];
+        let order_msg = format!(
+            "ETH/USDC:BUY:{}:{}:{}",
+            2000000 + i,
+            100 + (i % 50),
+            hex::encode(address)
+        );
+        let msg_hash: [u8; 32] = Sha256::digest(order_msg.as_bytes()).into();
+        let (r_x, r_y, s_limbs, e_limbs) = schnorr_sign(session, &msg_hash);
+
+        orders.push(DedupOrder {
+            key_idx: key_idx as u32,
+            market: "ETH/USDC".to_string(),
+            side: "BUY".to_string(),
+            price: 2000000 + i as u64,
+            quantity: 100 + (i % 50) as u64,
+            signature_r_x: r_x,
+            signature_r_y: r_y,
+            signature_s: s_limbs,
+            challenge_e: e_limbs,
+        });
+
+        if count >= 500 && (i + 1) % 500 == 0 {
+            println!("  generated {}/{} orders", i + 1, count);
+        }
+    }
+    orders.shuffle(&mut rng);
+
+    ProgramInput::BatchSepticDedupBatch(BatchSepticDedupBatchWitness {
+        session_key_root: root.0,
+        batch_proof,
+        unique_keys: key_infos,
+        orders,
+    })
+}
+
 /// Build a Merkle-checked batch using one already-registered session key.
 /// All `count` orders share the same JMT proof — same key, same tree
 /// snapshot, same root. Per-order JMT work in the guest is identical
@@ -945,6 +1092,46 @@ async fn main() -> Result<()> {
             println!("\nGenerating 6000 septic Schnorr + Merkle witnesses (host-side)...");
             let input = build_batch_septic_verify_merkle_input(&fix, &app, 6000);
             run_and_report("BatchSepticVerifyMerkle (6000 Shamir + Merkle)", input, ELF).await?;
+        }
+        Some(s) if s.starts_with("batch-septic-dedup-batch-") => {
+            // Same args as `batch-septic-dedup-<count>` but uses
+            // `BatchExistenceProof` (one JMT verify, cached hashes).
+            //   batch-septic-dedup-batch-6000 0.9667 6000  → 6000 orders,
+            //   ~200 unique keys, JMT holds 6000 keys.
+            let count: usize = s
+                .trim_start_matches("batch-septic-dedup-batch-")
+                .parse()
+                .expect("expected batch-septic-dedup-batch-<count>");
+            let ratio: f64 = args
+                .get(2)
+                .map(|s| s.parse().expect("ratio must be a number in [0, 1]"))
+                .unwrap_or(0.2);
+            assert!((0.0..=1.0).contains(&ratio), "ratio must be in [0, 1]");
+            let unique_count = (((count as f64) * (1.0 - ratio)).ceil() as usize).max(1);
+            let tree_size: usize = args
+                .get(3)
+                .map(|s| s.parse().expect("tree_size must be a positive int"))
+                .unwrap_or(unique_count);
+            assert!(
+                tree_size >= unique_count,
+                "tree_size ({}) must be >= unique_count ({})",
+                tree_size,
+                unique_count
+            );
+            println!(
+                "\nGenerating {} septic witnesses via BatchExistenceProof (unique={}, JMT size={})...",
+                count, unique_count, tree_size
+            );
+            let input = build_batch_septic_dedup_batch_input(count, unique_count, tree_size);
+            run_and_report(
+                &format!(
+                    "BatchSepticDedupBatch ({} orders, {} unique in batch, {} in JMT)",
+                    count, unique_count, tree_size
+                ),
+                input,
+                ELF,
+            )
+            .await?;
         }
         Some(s) if s.starts_with("batch-septic-dedup-") => {
             // Mode form: `batch-septic-dedup-<count> [ratio] [tree_size]`

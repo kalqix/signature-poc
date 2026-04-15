@@ -12,11 +12,11 @@ use jmt::{KeyHash, RootHash};
 
 use shared::{
     encode_session_key_leaf, session_key_hash,
-    BatchEthWitness, BatchSepticDedupWitness, BatchSepticOptWitness, BatchSepticSingleWitness,
-    BatchSepticVerifyMerkleWitness, BatchSepticVerifyWitness, BatchSepticWitness,
-    EthOrderWitness, OrderWitness, ProgramInput, ProofOutput, RegisterKeyWitness,
-    SessionKeyLeaf, VerifyOrderSepticWitness, eth_order_message, register_key_message,
-    septic_order_message,
+    BatchEthWitness, BatchSepticDedupBatchWitness, BatchSepticDedupWitness,
+    BatchSepticOptWitness, BatchSepticSingleWitness, BatchSepticVerifyMerkleWitness,
+    BatchSepticVerifyWitness, BatchSepticWitness, EthOrderWitness, OrderWitness, ProgramInput,
+    ProofOutput, RegisterKeyWitness, SessionKeyLeaf, VerifyOrderSepticWitness,
+    eth_order_message, register_key_message, septic_order_message,
     septic::{GENERATOR_X, GENERATOR_Y, GROUP_ORDER, scalar_add},
 };
 
@@ -810,6 +810,84 @@ fn handle_batch_septic_dedup(w: BatchSepticDedupWitness) {
     });
 }
 
+// ── Batch Septic Dedup (BatchExistenceProof: single verify call, shared-hash caching) ──
+
+/// Same shape as `handle_batch_septic_dedup`, but the unique-key Merkle
+/// membership is proved with a single `BatchExistenceProof::verify` call
+/// that caches intermediate Poseidon2 hashes at shared internal nodes.
+/// Expected win: ~40% reduction in `dedup_merkle_total` when the batch
+/// has overlapping key-prefix paths.
+fn handle_batch_septic_dedup_batch(w: BatchSepticDedupBatchWitness) {
+    let unique_count = w.unique_keys.len();
+    let order_count = w.orders.len();
+    let session_key_root = RootHash(w.session_key_root);
+
+    // 1. Single batch JMT verification (all unique keys in one pass).
+    println!("cycle-tracker-report-start: dedup_batch_merkle_total");
+    w.batch_proof
+        .verify(session_key_root)
+        .expect("BatchExistenceProof verify failed");
+    println!("cycle-tracker-report-end: dedup_batch_merkle_total");
+
+    // 2. Bind each proven entry to the claimed `unique_keys[i]`. The batch
+    //    proof authenticates the *value bytes* at each leaf but Schnorr
+    //    below pulls the pubkey from `unique_keys[idx]`, so a malicious host
+    //    could otherwise pair one key's proof with another key's pubkey.
+    //    Cross-check address, key_index, pubkey, and derived key_hash.
+    assert_eq!(
+        w.batch_proof.entries.len(),
+        unique_count,
+        "batch proof entry count must equal unique_keys length"
+    );
+    println!("cycle-tracker-report-start: dedup_batch_bind_leaves");
+    for (i, entry) in w.batch_proof.entries.iter().enumerate() {
+        let leaf: SessionKeyLeaf =
+            bincode::deserialize(&entry.value).expect("invalid session key leaf");
+        let key_info = &w.unique_keys[i];
+        assert!(
+            leaf.account_address == key_info.account_address
+                && leaf.key_index == key_info.key_index
+                && leaf.pubkey_x == key_info.pubkey_x
+                && leaf.pubkey_y == key_info.pubkey_y,
+            "leaf/unique_keys mismatch at entry {}",
+            i
+        );
+        let expected_key_hash = KeyHash(session_key_hash(
+            &key_info.account_address,
+            key_info.key_index,
+        ));
+        assert!(
+            entry.key_hash == expected_key_hash,
+            "entry key_hash does not match derived session_key_hash at entry {}",
+            i
+        );
+    }
+    println!("cycle-tracker-report-end: dedup_batch_bind_leaves");
+
+    // 3. Per-order Schnorr verify; pubkey from unique_keys (now bound).
+    println!("cycle-tracker-report-start: dedup_batch_schnorr_total");
+    for order in &w.orders {
+        let key = &w.unique_keys[order.key_idx as usize];
+        let r_point = sp1_lib::septic::SepticPoint::new(order.signature_r_x, order.signature_r_y);
+        let pubkey = sp1_lib::septic::SepticPoint::new(key.pubkey_x, key.pubkey_y);
+        let result =
+            sp1_lib::septic::schnorr_compute(&pubkey, &order.signature_s, &order.challenge_e);
+        assert!(
+            result.x() == r_point.x() && result.y() == r_point.y(),
+            "Schnorr verify failed in dedup batch"
+        );
+    }
+    println!("cycle-tracker-report-end: dedup_batch_schnorr_total");
+
+    commit_borsh(&ProofOutput {
+        old_session_key_root: w.session_key_root,
+        new_session_key_root: w.session_key_root,
+        account_address: [0u8; 20],
+        key_index: 0,
+        proof_type: format!("BATCH_SEPTIC_DEDUP_BATCH_{}u_{}o", unique_count, order_count),
+    });
+}
+
 // ── Batch Eth (secp256k1 EIP-191 ecrecover) ───────────────────────────────
 
 fn handle_batch_eth(w: BatchEthWitness) {
@@ -855,6 +933,7 @@ fn main() {
         ProgramInput::BatchSepticVerify(w) => handle_batch_septic_verify(w),
         ProgramInput::BatchSepticVerifyMerkle(w) => handle_batch_septic_verify_merkle(w),
         ProgramInput::BatchSepticDedup(w) => handle_batch_septic_dedup(w),
+        ProgramInput::BatchSepticDedupBatch(w) => handle_batch_septic_dedup_batch(w),
         ProgramInput::BatchEth(w) => handle_batch_eth(w),
     }
 }

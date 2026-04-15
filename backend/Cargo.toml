@@ -22,4 +22,4 @@ rand = "0.8"
 num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"
-jmt = { git = "https://github.com/kalqix/jmt", rev = "8112b48ad7d66789145e3dfd133924a632678100", default-features = false, features = ["std", "sha2", "mocks"] }
+jmt = { git = "https://github.com/kalqix/jmt", rev = "a307b363a83bce4edcc66fee162ba60c26f3557d", default-features = false, features = ["std", "sha2", "mocks"] }

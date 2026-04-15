@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use jmt::proof::SparseMerkleProof;
+use jmt::BatchExistenceProof;
 
 pub mod poseidon2_hasher;
 pub mod septic;
@@ -193,6 +194,29 @@ pub struct BatchSepticDedupWitness {
     pub session_key_root: [u8; 32],
 }
 
+/// Session-key metadata used by the batched dedup path. Pubkey is
+/// cross-checked against the leaf bytes that the BatchExistenceProof
+/// authenticates, so the guest can trust `unique_keys[idx]` for Schnorr.
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
+pub struct UniqueKeyInfo {
+    pub account_address: [u8; 20],
+    pub key_index: u8,
+    pub pubkey_x: [u32; 7],
+    pub pubkey_y: [u32; 7],
+}
+
+/// Batched dedup: a single `BatchExistenceProof` (with shared-hash caching)
+/// attests that every `unique_keys[i]` is present in the JMT, then orders
+/// reference those keys by index. Drop-in replacement for
+/// `BatchSepticDedupWitness` that exercises JMT's batch proof path.
+#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
+pub struct BatchSepticDedupBatchWitness {
+    pub session_key_root: [u8; 32],
+    pub batch_proof: BatchExistenceProof<Poseidon2Hasher>,
+    pub unique_keys: Vec<UniqueKeyInfo>,
+    pub orders: Vec<DedupOrder>,
+}
+
 #[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct BatchEthWitness {
     pub orders: Vec<EthOrderWitness>,
@@ -224,6 +248,7 @@ pub enum ProgramInput {
     BatchSepticVerify(BatchSepticVerifyWitness),
     BatchSepticVerifyMerkle(BatchSepticVerifyMerkleWitness),
     BatchSepticDedup(BatchSepticDedupWitness),
+    BatchSepticDedupBatch(BatchSepticDedupBatchWitness),
     BatchEth(BatchEthWitness),
 }
 
