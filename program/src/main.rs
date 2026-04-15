@@ -12,11 +12,11 @@ use jmt::{KeyHash, RootHash};
 
 use shared::{
     encode_session_key_leaf, session_key_hash,
-    BatchEthWitness, BatchSepticDedupBatchWitness, BatchSepticDedupWitness,
-    BatchSepticOptWitness, BatchSepticSingleWitness, BatchSepticVerifyMerkleWitness,
-    BatchSepticVerifyWitness, BatchSepticWitness, EthOrderWitness, OrderWitness, ProgramInput,
-    ProofOutput, RegisterKeyWitness, SessionKeyLeaf, VerifyOrderSepticWitness,
-    eth_order_message, register_key_message, septic_order_message,
+    ArchivedBatchSepticDedupBatchWitness, BatchEthWitness, BatchSepticDedupBatchWitness,
+    BatchSepticDedupWitness, BatchSepticOptWitness, BatchSepticSingleWitness,
+    BatchSepticVerifyMerkleWitness, BatchSepticVerifyWitness, BatchSepticWitness, EthOrderWitness,
+    OrderWitness, ProgramInput, ProofOutput, RegisterKeyWitness, SessionKeyLeaf,
+    VerifyOrderSepticWitness, eth_order_message, register_key_message, septic_order_message,
     septic::{GENERATOR_X, GENERATOR_Y, GROUP_ORDER, scalar_add},
 };
 
@@ -888,6 +888,146 @@ fn handle_batch_septic_dedup_batch(w: BatchSepticDedupBatchWitness) {
     });
 }
 
+// ── Batch Septic Dedup (rkyv zero-copy) ────────────────────────────────────
+
+/// Same verification semantics as `handle_batch_septic_dedup_batch`, but the
+/// witness is accessed *zero-copy* from the rkyv archive written by the host
+/// — no borsh deserialization of the ~1 MB order vector. The guest does:
+///
+///   1. `read_vec()` into an owned byte buffer.
+///   2. `rkyv::access_unchecked` to reinterpret those bytes as a reference
+///      to `ArchivedBatchSepticDedupBatchWitness` (just a pointer cast).
+///   3. Call `ArchivedBatchExistenceProof::verify` which has identical logic
+///      to the owned verify.
+///   4. Per-order Schnorr on the archived orders (fields converted via
+///      `to_native()` into `[u32; N]` arrays expected by the precompile).
+///
+/// The ~18M residual observed on the borsh path is dominated by deserialize
+/// overhead; this handler should collapse it to essentially the read_vec
+/// copy cost.
+fn handle_batch_septic_dedup_rkyv() {
+    // 1. Read the rkyv witness bytes (second stdin chunk).
+    println!("cycle-tracker-report-start: rkyv_read");
+    let bytes = sp1_zkvm::io::read_vec();
+    println!("cycle-tracker-report-end: rkyv_read");
+
+    // 2. Zero-copy access. `access_unchecked` is a pointer cast — it does
+    //    NOT validate the archive. The guest trusts that the host encoded
+    //    the witness correctly; any tampering produces a proof-verify
+    //    failure below.
+    println!("cycle-tracker-report-start: rkyv_access");
+    let archived: &ArchivedBatchSepticDedupBatchWitness =
+        unsafe { rkyv::access_unchecked::<ArchivedBatchSepticDedupBatchWitness>(&bytes) };
+    println!("cycle-tracker-report-end: rkyv_access");
+
+    let unique_count = archived.unique_keys.len();
+    let order_count = archived.orders.len();
+    let session_key_root_bytes: [u8; 32] = archived.session_key_root;
+    let session_key_root = RootHash(session_key_root_bytes);
+
+    // 3. Single batch JMT verify — directly on the archived representation.
+    println!("cycle-tracker-report-start: rkyv_merkle_total");
+    archived
+        .batch_proof
+        .verify(session_key_root)
+        .expect("ArchivedBatchExistenceProof verify failed");
+    println!("cycle-tracker-report-end: rkyv_merkle_total");
+
+    // 4. Bind each authenticated leaf to the claimed `unique_keys[i]` so
+    //    the host can't swap keys between Merkle and Schnorr verification.
+    assert_eq!(
+        archived.batch_proof.entries.len(),
+        unique_count,
+        "batch proof entry count must equal unique_keys length"
+    );
+    println!("cycle-tracker-report-start: rkyv_bind_leaves");
+    for (i, entry) in archived.batch_proof.entries.iter().enumerate() {
+        // `entry.value` is `ArchivedVec<u8>`; `as_slice()` gives `&[u8]`.
+        let leaf: SessionKeyLeaf =
+            bincode::deserialize(entry.value.as_slice()).expect("invalid session key leaf");
+        let key_info = &archived.unique_keys[i];
+        let info_address: [u8; 20] = key_info.account_address;
+        let info_pubkey_x: [u32; 7] = archived_array7_to_native(&key_info.pubkey_x);
+        let info_pubkey_y: [u32; 7] = archived_array7_to_native(&key_info.pubkey_y);
+        assert!(
+            leaf.account_address == info_address
+                && leaf.key_index == key_info.key_index
+                && leaf.pubkey_x == info_pubkey_x
+                && leaf.pubkey_y == info_pubkey_y,
+            "leaf/unique_keys mismatch at entry {}",
+            i
+        );
+        let expected_key_hash = session_key_hash(&info_address, key_info.key_index);
+        let proven_key_hash: [u8; 32] = entry.key_hash.0;
+        assert!(
+            proven_key_hash == expected_key_hash,
+            "entry key_hash does not match derived session_key_hash at entry {}",
+            i
+        );
+    }
+    println!("cycle-tracker-report-end: rkyv_bind_leaves");
+
+    // 5. Per-order Schnorr verify; pubkey from the now-bound unique_keys.
+    println!("cycle-tracker-report-start: rkyv_schnorr_total");
+    for order in archived.orders.iter() {
+        let key = &archived.unique_keys[order.key_idx.to_native() as usize];
+        let r_point = sp1_lib::septic::SepticPoint::new(
+            archived_array7_to_native(&order.signature_r_x),
+            archived_array7_to_native(&order.signature_r_y),
+        );
+        let pubkey = sp1_lib::septic::SepticPoint::new(
+            archived_array7_to_native(&key.pubkey_x),
+            archived_array7_to_native(&key.pubkey_y),
+        );
+        let s_limbs = archived_array8_to_native(&order.signature_s);
+        let e_limbs = archived_array8_to_native(&order.challenge_e);
+        let result = sp1_lib::septic::schnorr_compute(&pubkey, &s_limbs, &e_limbs);
+        assert!(
+            result.x() == r_point.x() && result.y() == r_point.y(),
+            "Schnorr verify failed in rkyv dedup batch"
+        );
+    }
+    println!("cycle-tracker-report-end: rkyv_schnorr_total");
+
+    commit_borsh(&ProofOutput {
+        old_session_key_root: session_key_root_bytes,
+        new_session_key_root: session_key_root_bytes,
+        account_address: [0u8; 20],
+        key_index: 0,
+        proof_type: format!("BATCH_SEPTIC_DEDUP_RKYV_{}u_{}o", unique_count, order_count),
+    });
+}
+
+/// Archived `[u32; 7]` stores each element as `rend::u32_le` (transparent
+/// wrapper on LE targets); convert back to the native `[u32; 7]` shape
+/// expected by the septic precompile.
+#[inline(always)]
+fn archived_array7_to_native(arr: &rkyv::Archived<[u32; 7]>) -> [u32; 7] {
+    [
+        arr[0].to_native(),
+        arr[1].to_native(),
+        arr[2].to_native(),
+        arr[3].to_native(),
+        arr[4].to_native(),
+        arr[5].to_native(),
+        arr[6].to_native(),
+    ]
+}
+
+#[inline(always)]
+fn archived_array8_to_native(arr: &rkyv::Archived<[u32; 8]>) -> [u32; 8] {
+    [
+        arr[0].to_native(),
+        arr[1].to_native(),
+        arr[2].to_native(),
+        arr[3].to_native(),
+        arr[4].to_native(),
+        arr[5].to_native(),
+        arr[6].to_native(),
+        arr[7].to_native(),
+    ]
+}
+
 // ── Batch Eth (secp256k1 EIP-191 ecrecover) ───────────────────────────────
 
 fn handle_batch_eth(w: BatchEthWitness) {
@@ -934,6 +1074,7 @@ fn main() {
         ProgramInput::BatchSepticVerifyMerkle(w) => handle_batch_septic_verify_merkle(w),
         ProgramInput::BatchSepticDedup(w) => handle_batch_septic_dedup(w),
         ProgramInput::BatchSepticDedupBatch(w) => handle_batch_septic_dedup_batch(w),
+        ProgramInput::BatchSepticDedupRkyv => handle_batch_septic_dedup_rkyv(),
         ProgramInput::BatchEth(w) => handle_batch_eth(w),
     }
 }

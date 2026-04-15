@@ -12,12 +12,16 @@ use jmt::SimpleHasher;
 /// times per node hash (domain separator + key + value); we accumulate
 /// all bytes and call the underlying one-shot hasher in `finalize`.
 ///
-/// `Clone + Debug` are required because `BatchExistenceProof<H>` derives
-/// them (unlike `SparseMerkleProof<H>` which has manual impls). Our
-/// witnesses embed `BatchExistenceProof<Poseidon2Hasher>`, so the
-/// derives need `Poseidon2Hasher: Clone + Debug` even though only the
-/// `PhantomData<H>` marker ever lives inside an actual proof value.
-#[derive(Clone, Debug)]
+/// Derive bounds explained:
+/// - `Clone + Debug`: `BatchExistenceProof<H>` derives these (unlike
+///   `SparseMerkleProof<H>` which has manual impls), so outer structs
+///   embedding `BatchExistenceProof<Poseidon2Hasher>` need them.
+/// - `rkyv::Archive + Serialize + Deserialize`: outer witnesses carrying
+///   `BatchExistenceProof<Poseidon2Hasher>` derive rkyv, and even though
+///   the proof's `phantom_hasher: PhantomData<H>` is `#[rkyv(with = Skip)]`,
+///   the derived bounds still mention `H`. The actual archived value
+///   is zero-sized (no buffer lives in any on-wire form).
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Poseidon2Hasher {
     buffer: Vec<u8>,
 }

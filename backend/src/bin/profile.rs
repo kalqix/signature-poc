@@ -554,11 +554,15 @@ fn build_batch_septic_dedup_input(
 /// a single `BatchExistenceProof`. Tree construction and order
 /// distribution are identical, so cycle-count deltas against the
 /// non-batch builder isolate the `BatchExistenceProof::verify` win.
-fn build_batch_septic_dedup_batch_input(
+///
+/// Returns the raw witness so it can be wrapped into either
+/// `ProgramInput::BatchSepticDedupBatch(..)` (borsh path) or handed
+/// directly to `run_and_report_rkyv` (zero-copy path).
+fn build_batch_septic_dedup_batch_witness(
     count: usize,
     unique_count: usize,
     tree_size: usize,
-) -> ProgramInput {
+) -> shared::BatchSepticDedupBatchWitness {
     use jmt::mock::MockTreeStore;
     use jmt::{build_batch_existence_proof, JellyfishMerkleTree, KeyHash};
     use rand::seq::SliceRandom;
@@ -688,12 +692,26 @@ fn build_batch_septic_dedup_batch_input(
     }
     orders.shuffle(&mut rng);
 
-    ProgramInput::BatchSepticDedupBatch(BatchSepticDedupBatchWitness {
+    BatchSepticDedupBatchWitness {
         session_key_root: root.0,
         batch_proof,
         unique_keys: key_infos,
         orders,
-    })
+    }
+}
+
+/// Borsh-path wrapper: calls `build_batch_septic_dedup_batch_witness` and
+/// wraps the result in `ProgramInput::BatchSepticDedupBatch`.
+fn build_batch_septic_dedup_batch_input(
+    count: usize,
+    unique_count: usize,
+    tree_size: usize,
+) -> ProgramInput {
+    ProgramInput::BatchSepticDedupBatch(build_batch_septic_dedup_batch_witness(
+        count,
+        unique_count,
+        tree_size,
+    ))
 }
 
 /// Build a Merkle-checked batch using one already-registered session key.
@@ -919,6 +937,80 @@ async fn run_and_report(label: &str, input: ProgramInput, elf: &[u8]) -> Result<
     Ok(())
 }
 
+/// Like `run_and_report`, but writes the witness as raw rkyv bytes in a
+/// second stdin chunk. The guest reads the `ProgramInput` tag from the
+/// first chunk and the rkyv witness from the second via `read_vec()`,
+/// then accesses it zero-copy with `rkyv::access_unchecked`.
+async fn run_and_report_rkyv(
+    label: &str,
+    witness: &shared::BatchSepticDedupBatchWitness,
+    elf: &[u8],
+) -> Result<()> {
+    let client = ProverClient::builder().cpu().build().await;
+
+    let tag_bytes = borsh::to_vec(&shared::ProgramInput::BatchSepticDedupRkyv)
+        .expect("borsh serialize rkyv tag");
+    let rkyv_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(witness)
+        .expect("rkyv serialize witness");
+    let rkyv_len = rkyv_bytes.len();
+    let total_input = tag_bytes.len() + rkyv_len;
+
+    let mut stdin = SP1Stdin::new();
+    stdin.write_vec(tag_bytes);
+    stdin.write_slice(rkyv_bytes.as_ref());
+
+    println!("\n============================================================");
+    println!("  Profiling: {label}");
+    println!("============================================================");
+    println!(
+        "  input_size:         {total_input} bytes (1 B borsh tag + {rkyv_len} B rkyv witness)"
+    );
+
+    let (public_values, report) = client
+        .execute(Elf::from(elf), stdin)
+        .await
+        .map_err(|e| anyhow::anyhow!("execution failed: {e}"))?;
+
+    let output: ProofOutput =
+        borsh::from_slice(public_values.as_slice()).expect("borsh deserialize public output");
+
+    let total = report.total_instruction_count() + report.total_syscall_count();
+    let gas_opt = report.gas();
+    println!("  proof_type:         {}", output.proof_type);
+    println!("  total_instructions: {}", report.total_instruction_count());
+    println!("  total_syscalls:     {}", report.total_syscall_count());
+    println!("  total_cycles:       {total}");
+    if let Some(gas) = gas_opt {
+        let gas_per_cycle = gas as f64 / total as f64;
+        println!("  gas (normalized):   {gas}  ({gas_per_cycle:.3} gas/cycle)");
+    }
+    println!("  touched_memory:     {}", report.touched_memory_addresses);
+
+    if !report.cycle_tracker.is_empty() {
+        println!("\n  Cycle tracker breakdown:");
+        let header_gas = if gas_opt.is_some() { "gas (est.)" } else { "" };
+        println!(
+            "    {:<30} {:>12} {:>14} {:>7}",
+            "section", "cycles", header_gas, "%"
+        );
+        let mut entries: Vec<_> = report.cycle_tracker.iter().collect();
+        entries.sort_by_key(|(_, v)| std::cmp::Reverse(**v));
+        for (name, cycles) in entries {
+            let pct = (*cycles as f64 / total as f64) * 100.0;
+            let gas_est_str = match gas_opt {
+                Some(total_gas) => {
+                    let est = (*cycles as u128 * total_gas as u128 / total as u128) as u64;
+                    format!("{est}")
+                }
+                None => String::new(),
+            };
+            println!("    {name:<30} {cycles:>12} {gas_est_str:>14} {pct:>6.1}%");
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -1092,6 +1184,46 @@ async fn main() -> Result<()> {
             println!("\nGenerating 6000 septic Schnorr + Merkle witnesses (host-side)...");
             let input = build_batch_septic_verify_merkle_input(&fix, &app, 6000);
             run_and_report("BatchSepticVerifyMerkle (6000 Shamir + Merkle)", input, ELF).await?;
+        }
+        Some(s) if s.starts_with("batch-septic-dedup-rkyv-") => {
+            // Same args as `batch-septic-dedup-batch-<count>` but the witness
+            // travels to the guest as raw rkyv bytes (second stdin chunk) and
+            // is accessed zero-copy — no borsh deserialization.
+            let count: usize = s
+                .trim_start_matches("batch-septic-dedup-rkyv-")
+                .parse()
+                .expect("expected batch-septic-dedup-rkyv-<count>");
+            let ratio: f64 = args
+                .get(2)
+                .map(|s| s.parse().expect("ratio must be a number in [0, 1]"))
+                .unwrap_or(0.2);
+            assert!((0.0..=1.0).contains(&ratio), "ratio must be in [0, 1]");
+            let unique_count = (((count as f64) * (1.0 - ratio)).ceil() as usize).max(1);
+            let tree_size: usize = args
+                .get(3)
+                .map(|s| s.parse().expect("tree_size must be a positive int"))
+                .unwrap_or(unique_count);
+            assert!(
+                tree_size >= unique_count,
+                "tree_size ({}) must be >= unique_count ({})",
+                tree_size,
+                unique_count
+            );
+            println!(
+                "\nGenerating {} septic witnesses via rkyv zero-copy (unique={}, JMT size={})...",
+                count, unique_count, tree_size
+            );
+            let witness =
+                build_batch_septic_dedup_batch_witness(count, unique_count, tree_size);
+            run_and_report_rkyv(
+                &format!(
+                    "BatchSepticDedupRkyv ({} orders, {} unique in batch, {} in JMT)",
+                    count, unique_count, tree_size
+                ),
+                &witness,
+                ELF,
+            )
+            .await?;
         }
         Some(s) if s.starts_with("batch-septic-dedup-batch-") => {
             // Same args as `batch-septic-dedup-<count>` but uses

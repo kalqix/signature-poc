@@ -171,7 +171,17 @@ pub struct DedupKey {
 /// One signed order in a deduped batch. Schnorr verifies per-order; the
 /// pubkey comes from `unique_keys[key_idx]` so the same Merkle-verified key
 /// can authorize many orders.
-#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
+#[derive(
+    Serialize,
+    Deserialize,
+    borsh::BorshSerialize,
+    borsh::BorshDeserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Clone,
+    Debug,
+)]
 pub struct DedupOrder {
     pub key_idx: u32,
     pub market: String,
@@ -197,7 +207,17 @@ pub struct BatchSepticDedupWitness {
 /// Session-key metadata used by the batched dedup path. Pubkey is
 /// cross-checked against the leaf bytes that the BatchExistenceProof
 /// authenticates, so the guest can trust `unique_keys[idx]` for Schnorr.
-#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
+#[derive(
+    Serialize,
+    Deserialize,
+    borsh::BorshSerialize,
+    borsh::BorshDeserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Clone,
+    Debug,
+)]
 pub struct UniqueKeyInfo {
     pub account_address: [u8; 20],
     pub key_index: u8,
@@ -209,7 +229,17 @@ pub struct UniqueKeyInfo {
 /// attests that every `unique_keys[i]` is present in the JMT, then orders
 /// reference those keys by index. Drop-in replacement for
 /// `BatchSepticDedupWitness` that exercises JMT's batch proof path.
-#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
+#[derive(
+    Serialize,
+    Deserialize,
+    borsh::BorshSerialize,
+    borsh::BorshDeserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Clone,
+    Debug,
+)]
 pub struct BatchSepticDedupBatchWitness {
     pub session_key_root: [u8; 32],
     pub batch_proof: BatchExistenceProof<Poseidon2Hasher>,
@@ -249,6 +279,10 @@ pub enum ProgramInput {
     BatchSepticVerifyMerkle(BatchSepticVerifyMerkleWitness),
     BatchSepticDedup(BatchSepticDedupWitness),
     BatchSepticDedupBatch(BatchSepticDedupBatchWitness),
+    /// Unit variant — the borsh-encoded `ProgramInput` is just the tag.
+    /// The guest reads an additional rkyv-encoded `BatchSepticDedupBatchWitness`
+    /// from the next `read_vec()` call and accesses it zero-copy.
+    BatchSepticDedupRkyv,
     BatchEth(BatchEthWitness),
 }
 
