@@ -132,11 +132,17 @@ fn leaf_index_for(address: &[u8; 20], key_index: u8) -> u64 {
     (hash[0] as u64 * 254 + key_index as u64) % 256
 }
 
-fn hash_leaf(address: &[u8; 20], key_index: u8, pubkey: &[u8; 32]) -> [u8; 32] {
+fn hash_leaf(
+    address: &[u8; 20],
+    key_index: u8,
+    pubkey_x: &[u32; 7],
+    pubkey_y: &[u32; 7],
+) -> [u8; 32] {
     let leaf = SessionKeyLeaf {
         account_address: *address,
         key_index,
-        pubkey: *pubkey,
+        pubkey_x: *pubkey_x,
+        pubkey_y: *pubkey_y,
     };
     let encoded = bincode::serialize(&leaf).expect("bincode serialize");
     poseidon2_hash_bytes(&encoded)
@@ -184,7 +190,7 @@ impl AppState {
         let old_root = self.current_root;
         let siblings = get_siblings(&self.session_key_tree.leaves, idx);
 
-        let leaf_hash = hash_leaf(&address, key.key_index, &key.pubkey);
+        let leaf_hash = hash_leaf(&address, key.key_index, &key.pubkey_x, &key.pubkey_y);
         set_leaf(&mut self.session_key_tree.leaves, idx as usize, leaf_hash);
         let new_root = compute_root(&self.session_key_tree.leaves);
         self.current_root = new_root;
@@ -249,7 +255,8 @@ mod tests {
         let mut state = AppState::new();
         let address = [0xAB; 20];
         let key = SessionKey {
-            pubkey: [0x01; 32],
+            pubkey_x: [0x01; 7],
+            pubkey_y: [0x02; 7],
             key_index: 0,
         };
         let (old_leaf_hash, old_root, new_root, siblings, idx) = state.register_key(address, key.clone());
@@ -260,9 +267,10 @@ mod tests {
 
         let (found_key, new_siblings, found_idx) =
             state.get_key_proof(address, 0).expect("key should exist");
-        assert_eq!(found_key.pubkey, key.pubkey);
+        assert_eq!(found_key.pubkey_x, key.pubkey_x);
+        assert_eq!(found_key.pubkey_y, key.pubkey_y);
         assert_eq!(found_idx, idx);
-        let leaf_hash = hash_leaf(&address, 0, &found_key.pubkey);
+        let leaf_hash = hash_leaf(&address, 0, &found_key.pubkey_x, &found_key.pubkey_y);
         assert!(verify_proof(leaf_hash, found_idx, &new_siblings, new_root));
     }
 

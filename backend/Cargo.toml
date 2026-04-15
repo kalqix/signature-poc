@@ -17,12 +17,10 @@ tiny-keccak = { version = "2.0", features = ["keccak"] }
 bincode = "1"
 anyhow = "1"
 k256 = { version = "0.13", features = ["ecdsa"] }
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand = "0.8"
 sp1-primitives = "6.0.2"
 p3-field = "0.3.2-succinct"
 p3-symmetric = "0.3.2-succinct"
-p256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"

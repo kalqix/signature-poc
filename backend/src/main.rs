@@ -16,8 +16,9 @@ use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
 use shared::{
-    EthOrderWitness, EthSignedOrder, OrderWitness, P256OrderWitness, P256SignedOrder,
-    ProgramInput, RegisterKeyRequest, RegisterKeyWitness, SessionKey, SignedOrder,
+    BatchSepticVerifyMerkleWitness, EthOrderWitness, EthSignedOrder, OrderWitness, ProgramInput,
+    RegisterKeyRequest, RegisterKeyWitness, SepticMerkleOrder, SessionKey, SignedOrder,
+    septic::SepticBenchWitness,
 };
 use state::AppState;
 use witness::run_proof;
@@ -48,7 +49,7 @@ async fn main() {
         .route("/register-key", post(register_key))
         .route("/place-order", post(place_order))
         .route("/place-order-eth", post(place_order_eth))
-        .route("/place-order-p256", post(place_order_p256))
+        .route("/place-order-septic", post(place_order_septic))
         .route("/state", get(get_state))
         .layer(cors)
         .with_state(state);
@@ -62,13 +63,9 @@ async fn register_key(
     State(state): State<ServerState>,
     Json(req): Json<RegisterKeyRequest>,
 ) -> impl IntoResponse {
-    let pubkey_bytes: [u8; 32] = match hex::decode(&req.pubkey_hex) {
-        Ok(b) if b.len() == 32 => b.try_into().unwrap(),
-        _ => return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid pubkey_hex"}))),
-    };
-
     let key = SessionKey {
-        pubkey: pubkey_bytes,
+        pubkey_x: req.pubkey_x,
+        pubkey_y: req.pubkey_y,
         key_index: req.key_index,
     };
 
@@ -247,14 +244,37 @@ async fn place_order_eth(
     }
 }
 
-async fn place_order_p256(
+async fn place_order_septic(
     State(state): State<ServerState>,
-    Json(order): Json<P256SignedOrder>,
+    Json(witness): Json<SepticBenchWitness>,
 ) -> impl IntoResponse {
-    let witness = P256OrderWitness {
-        order: order.clone(),
+    let account_address = witness.order.account_address;
+    let key_index = witness.order.key_index;
+
+    // Look up the session key's Merkle proof. If the client-supplied pubkey
+    // doesn't match what's at this leaf, the guest's Merkle check will fail.
+    let (siblings, leaf_index, root) = {
+        let app = state.app.lock().await;
+        match app.get_key_proof(account_address, key_index) {
+            Some((_key, sibs, idx)) => (sibs, idx, app.current_root),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "Session key not registered"})),
+                )
+            }
+        }
     };
-    let input = ProgramInput::VerifyOrderP256(witness);
+
+    let entry = SepticMerkleOrder {
+        bench: witness,
+        merkle_siblings: siblings,
+        leaf_index,
+    };
+    let input = ProgramInput::BatchSepticVerifyMerkle(BatchSepticVerifyMerkleWitness {
+        orders: vec![entry],
+        session_key_root: root,
+    });
 
     match run_proof(input, ELF, &state.prover).await {
         Ok(result) => {
@@ -263,7 +283,7 @@ async fn place_order_p256(
             let total_syscalls = report.total_syscall_count();
             let sys_calls = report.syscall_counts.clone();
             println!(
-                "VERIFY_ORDER_P256 proof succeeded: account={} key_index={} | instructions={} syscalls={} gas={:?} sys_call={:?}",
+                "VERIFY_ORDER_SEPTIC_MERKLE proof succeeded: account={} key_index={} | instructions={} syscalls={} gas={:?} sys_calls={:?}",
                 hex::encode(result.output.account_address),
                 result.output.key_index,
                 total_instructions,
@@ -275,8 +295,7 @@ async fn place_order_p256(
                 StatusCode::OK,
                 Json(json!({
                     "success": true,
-                    "proof_type": "VERIFY_ORDER_P256",
-                    "order": order,
+                    "proof_type": "VERIFY_ORDER_SEPTIC_MERKLE",
                     "execution_report": {
                         "total_instructions": total_instructions,
                         "total_syscalls": total_syscalls,
@@ -288,7 +307,7 @@ async fn place_order_p256(
             )
         }
         Err(e) => {
-            eprintln!("VERIFY_ORDER_P256 proof failed: {e}");
+            eprintln!("VERIFY_ORDER_SEPTIC_MERKLE proof failed: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("proof failed: {e}")})),

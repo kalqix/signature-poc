@@ -1,13 +1,14 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useSignMessage } from 'wagmi'
 import { loadKeyPair, storeKeyPair, markRegistered } from './db.js'
-import { bytesToHex } from './utils.js'
+import { generateSepticKeyPair, septicPubkeyToHex } from './septic.js'
 
 const API = 'http://localhost:3001'
 const KEY_INDICES = [0, 1, 2, 3, 4]
 
 const styles = {
   heading: { marginBottom: 12 },
+  subheading: { marginTop: 24, marginBottom: 8, fontSize: 14, color: '#aaa' },
   keyRow: {
     display: 'flex',
     alignItems: 'center',
@@ -39,8 +40,40 @@ const styles = {
   success: { color: '#6c6' },
 }
 
-export default function RegisterKeyComponent({ address, onRegistered }) {
-  // keys[i] = { pubKeyHex, registered } or null
+function addressToBytes(addrHex) {
+  const bytes = []
+  for (let i = 0; i < 20; i++) {
+    bytes.push(parseInt(addrHex.substring(i * 2, i * 2 + 2), 16))
+  }
+  return bytes
+}
+
+// Must match `shared::register_key_message`: pubkey is hex of 56 bytes (x[28 LE] || y[28 LE]).
+function buildRegisterMessage(addrLower, pubX, pubY, keyIndex) {
+  const bytes = new Uint8Array(56)
+  const dv = new DataView(bytes.buffer)
+  for (let i = 0; i < 7; i++) {
+    dv.setUint32(i * 4, pubX[i], true)
+    dv.setUint32(28 + i * 4, pubY[i], true)
+  }
+  const pubkeyHex = Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')
+  return [
+    'Register KalqiX Session Key',
+    '',
+    `pubkey: 0x${pubkeyHex}`,
+    `account: 0x${addrLower}`,
+    `key index: ${keyIndex}`,
+    'Only sign this message for a trusted client!',
+  ].join('\n')
+}
+
+export default function RegisterKeyComponent({
+  address,
+  wasmReady,
+  onRegistered,
+}) {
   const [keys, setKeys] = useState(() => KEY_INDICES.map(() => null))
   const [status, setStatus] = useState('')
   const [isError, setIsError] = useState(false)
@@ -54,10 +87,13 @@ export default function RegisterKeyComponent({ address, onRegistered }) {
         const record = await loadKeyPair(address, i)
         if (!record) return null
         return {
-          pubKeyHex: bytesToHex(new Uint8Array(record.pubKey)),
+          pubKeyHex: septicPubkeyToHex(
+            new Uint32Array(record.pubX),
+            new Uint32Array(record.pubY),
+          ),
           registered: !!record.registered,
         }
-      })
+      }),
     )
     setKeys(loaded)
     if (loaded.some((k) => k?.registered)) onRegistered()
@@ -67,25 +103,6 @@ export default function RegisterKeyComponent({ address, onRegistered }) {
     loadAllKeys()
   }, [loadAllKeys])
 
-  function addressToBytes(addrHex) {
-    const bytes = []
-    for (let i = 0; i < 20; i++) {
-      bytes.push(parseInt(addrHex.substring(i * 2, i * 2 + 2), 16))
-    }
-    return bytes
-  }
-
-  async function generateAndStore(keyIndex) {
-    const kp = await crypto.subtle.generateKey(
-      { name: 'Ed25519' },
-      false,
-      ['sign', 'verify']
-    )
-    const pubKeyBytes = await crypto.subtle.exportKey('raw', kp.publicKey)
-    await storeKeyPair(address, keyIndex, kp, pubKeyBytes, false)
-    return bytesToHex(new Uint8Array(pubKeyBytes))
-  }
-
   async function handleRegisterOrRotate(keyIndex) {
     setBusy(keyIndex)
     setStatus('')
@@ -93,27 +110,26 @@ export default function RegisterKeyComponent({ address, onRegistered }) {
 
     try {
       const existing = keys[keyIndex]
-      let pubHex
 
-      if (!existing) {
-        // Fresh: generate key first
-        setStatus(`Generating key ${keyIndex}...`)
-        pubHex = await generateAndStore(keyIndex)
-      } else {
-        // Rotation: generate NEW key, overwrite old
-        setStatus(`Generating new key for index ${keyIndex}...`)
-        pubHex = await generateAndStore(keyIndex)
-      }
+      setStatus(
+        existing
+          ? `Generating new septic key for index ${keyIndex}...`
+          : `Generating septic key for index ${keyIndex}...`,
+      )
+      const kp = generateSepticKeyPair()
+      const pubX = Array.from(kp.pubX)
+      const pubY = Array.from(kp.pubY)
+      const privLimbs = Array.from(kp.privLimbs)
+
+      await storeKeyPair(address, keyIndex, {
+        privLimbs,
+        pubX,
+        pubY,
+        registered: false,
+      })
 
       const addrLower = address.toLowerCase().replace('0x', '')
-      const message = [
-        'Register KalqiX Session Key',
-        '',
-        `pubkey: 0x${pubHex}`,
-        `account: 0x${addrLower}`,
-        `key index: ${keyIndex}`,
-        'Only sign this message for a trusted client!',
-      ].join('\n')
+      const message = buildRegisterMessage(addrLower, pubX, pubY, keyIndex)
 
       setStatus('Requesting wallet signature...')
       const ethSig = await signMessageAsync({ message })
@@ -122,7 +138,8 @@ export default function RegisterKeyComponent({ address, onRegistered }) {
       const body = {
         account_address: addressToBytes(addrLower),
         key_index: keyIndex,
-        pubkey_hex: pubHex,
+        pubkey_x: pubX,
+        pubkey_y: pubY,
         eth_signature_hex: ethSig.replace('0x', ''),
       }
 
@@ -139,7 +156,7 @@ export default function RegisterKeyComponent({ address, onRegistered }) {
         setStatus(
           existing
             ? `Key ${keyIndex} rotated! New root: ${data.new_root}`
-            : `Key ${keyIndex} registered! New root: ${data.new_root}`
+            : `Key ${keyIndex} registered! New root: ${data.new_root}`,
         )
         setIsError(false)
         await loadAllKeys()
@@ -157,34 +174,38 @@ export default function RegisterKeyComponent({ address, onRegistered }) {
 
   return (
     <div>
-      <h3 style={styles.heading}>Session Keys</h3>
+      <h3 style={styles.heading}>Session Keys (Septic Schnorr)</h3>
 
       {KEY_INDICES.map((i) => {
         const key = keys[i]
+        const disabled = busy !== null || !wasmReady
         return (
           <div key={i} style={styles.keyRow}>
             <span style={styles.keyIndex}>Key {i}:</span>
             {key ? (
               <>
                 <span style={styles.keyHex}>
-                  0x{key.pubKeyHex.substring(0, 16)}...{key.pubKeyHex.substring(48)}
+                  0x{key.pubKeyHex.substring(0, 16)}...
+                  {key.pubKeyHex.substring(key.pubKeyHex.length - 12)}
                 </span>
                 {key.registered && <span style={styles.badge}>Active</span>}
                 <button
                   style={styles.btn}
                   onClick={() => handleRegisterOrRotate(i)}
-                  disabled={busy !== null}
+                  disabled={disabled}
                 >
                   {busy === i ? '...' : 'Rotate'}
                 </button>
               </>
             ) : (
               <>
-                <span style={styles.empty}>(empty)</span>
+                <span style={styles.empty}>
+                  {wasmReady ? '(empty)' : '(WASM loading...)'}
+                </span>
                 <button
                   style={styles.btn}
                   onClick={() => handleRegisterOrRotate(i)}
-                  disabled={busy !== null}
+                  disabled={disabled}
                 >
                   {busy === i ? '...' : 'Register'}
                 </button>
@@ -195,7 +216,12 @@ export default function RegisterKeyComponent({ address, onRegistered }) {
       })}
 
       {status && (
-        <div style={{ ...styles.status, ...(isError ? styles.error : styles.success) }}>
+        <div
+          style={{
+            ...styles.status,
+            ...(isError ? styles.error : styles.success),
+          }}
+        >
           {status}
         </div>
       )}

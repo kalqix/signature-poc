@@ -1,7 +1,7 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { useSignMessage } from 'wagmi'
-import { loadKeyPair, loadP256KeyPair, storeP256KeyPair } from './db.js'
-import { bytesToHex } from './utils.js'
+import { loadKeyPair } from './db.js'
+import { signSepticOrder } from './septic.js'
 
 const API = 'http://localhost:3001'
 
@@ -42,8 +42,15 @@ const styles = {
   reduction: { color: '#6f6', fontWeight: 'bold' },
 }
 
-export default function PlaceOrderComponent({ address }) {
-  const [keyPair, setKeyPair] = useState(null)
+function addressToBytes(addrHex) {
+  const bytes = []
+  for (let i = 0; i < 20; i++) {
+    bytes.push(parseInt(addrHex.substring(i * 2, i * 2 + 2), 16))
+  }
+  return bytes
+}
+
+export default function PlaceOrderComponent({ address, wasmReady }) {
   const [market, setMarket] = useState('ETH/USDC')
   const [side, setSide] = useState('BUY')
   const [price, setPrice] = useState('')
@@ -51,73 +58,33 @@ export default function PlaceOrderComponent({ address }) {
   const [status, setStatus] = useState('')
   const [isError, setIsError] = useState(false)
   const [orders, setOrders] = useState([])
-  const [sigScheme, setSigScheme] = useState('ed25519')
-  const [p256KeyPair, setP256KeyPair] = useState(null)
-  const [ed25519Cycles, setEd25519Cycles] = useState(null)
+  const [sigScheme, setSigScheme] = useState('septic')
+  const [septicCycles, setSepticCycles] = useState(null)
   const [secp256k1Cycles, setSecp256k1Cycles] = useState(null)
-  const [p256Cycles, setP256Cycles] = useState(null)
 
   const { signMessageAsync } = useSignMessage()
 
-  useEffect(() => {
-    loadKey()
-    loadP256Key()
-  }, [address])
-
-  async function loadKey() {
+  async function handlePlaceOrderSeptic() {
     const record = await loadKeyPair(address, 0)
-    if (record) setKeyPair(record.keyPair)
-  }
-
-  async function loadP256Key() {
-    const record = await loadP256KeyPair(address)
-    if (record) {
-      setP256KeyPair(record.keyPair)
-    }
-  }
-
-  async function getOrCreateP256KeyPair() {
-    if (p256KeyPair) return p256KeyPair
-    const kp = await crypto.subtle.generateKey(
-      { name: 'ECDSA', namedCurve: 'P-256' },
-      false,
-      ['sign', 'verify']
-    )
-    const pubKeyBytes = new Uint8Array(
-      await crypto.subtle.exportKey('raw', kp.publicKey)
-    )
-    await storeP256KeyPair(address, kp, pubKeyBytes)
-    setP256KeyPair(kp)
-    return kp
-  }
-
-  function addressToBytes(addrHex) {
-    const bytes = []
-    for (let i = 0; i < 20; i++) {
-      bytes.push(parseInt(addrHex.substring(i * 2, i * 2 + 2), 16))
-    }
-    return bytes
-  }
-
-  async function handlePlaceOrderEd25519() {
-    if (!keyPair) {
-      setStatus('No session key found')
+    if (!record || !record.registered) {
+      setStatus('No registered session key for index 0 — register one above.')
       setIsError(true)
-      return
+      return null
     }
 
     const priceNum = parseInt(price, 10)
     const qtyNum = parseInt(quantity, 10)
     const addrLower = address.toLowerCase().replace('0x', '')
     const orderMsg = `${market}:${side}:${priceNum}:${qtyNum}:${addrLower}`
-    const msgBytes = new TextEncoder().encode(orderMsg)
-    const hash = await crypto.subtle.digest('SHA-256', msgBytes)
 
-    const sigBytes = await crypto.subtle.sign(
-      { name: 'Ed25519' },
-      keyPair.privateKey,
-      new Uint8Array(hash)
+    const started = performance.now()
+    const sig = signSepticOrder(
+      new Uint32Array(record.privLimbs),
+      new Uint32Array(record.pubX),
+      new Uint32Array(record.pubY),
+      orderMsg,
     )
+    const elapsed = (performance.now() - started).toFixed(0)
 
     const body = {
       account_address: addressToBytes(addrLower),
@@ -126,7 +93,10 @@ export default function PlaceOrderComponent({ address }) {
       side,
       price: priceNum,
       quantity: qtyNum,
-      ed25519_signature_hex: bytesToHex(new Uint8Array(sigBytes)),
+      signature_r_x: Array.from(sig.rX),
+      signature_r_y: Array.from(sig.rY),
+      signature_s: Array.from(sig.s),
+      challenge_e: Array.from(sig.challengeE),
     }
 
     const res = await fetch(`${API}/place-order`, {
@@ -134,7 +104,8 @@ export default function PlaceOrderComponent({ address }) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     })
-    return res.json()
+    const data = await res.json()
+    return { ...data, _signTimeMs: elapsed }
   }
 
   async function handlePlaceOrderEth() {
@@ -163,45 +134,6 @@ export default function PlaceOrderComponent({ address }) {
     return res.json()
   }
 
-  async function handlePlaceOrderP256() {
-    const priceNum = parseInt(price, 10)
-    const qtyNum = parseInt(quantity, 10)
-    const addrLower = address.toLowerCase().replace('0x', '')
-    const orderMsg = `${market}:${side}:${priceNum}:${qtyNum}:${addrLower}`
-    const msgBytes = new TextEncoder().encode(orderMsg)
-
-    const kp = await getOrCreateP256KeyPair()
-    // Web Crypto ECDSA with hash:'SHA-256' hashes msgBytes internally before signing.
-    // Guest program uses verify_prehash on SHA-256(message), so pass raw message here.
-    const rawSig = new Uint8Array(await crypto.subtle.sign(
-      { name: 'ECDSA', hash: 'SHA-256' },
-      kp.privateKey,
-      msgBytes
-    ))
-
-    const pubKeyBytes = new Uint8Array(
-      await crypto.subtle.exportKey('raw', kp.publicKey)
-    )
-
-    const body = {
-      account_address: addressToBytes(addrLower),
-      key_index: 0,
-      market,
-      side,
-      price: priceNum,
-      quantity: qtyNum,
-      p256_signature_hex: bytesToHex(rawSig),
-      p256_pubkey_hex: bytesToHex(pubKeyBytes),
-    }
-
-    const res = await fetch(`${API}/place-order-p256`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    })
-    return res.json()
-  }
-
   async function handlePlaceOrder() {
     const priceNum = parseInt(price, 10)
     const qtyNum = parseInt(quantity, 10)
@@ -215,21 +147,29 @@ export default function PlaceOrderComponent({ address }) {
     setIsError(false)
 
     try {
-      let data
-      if (sigScheme === 'ed25519') data = await handlePlaceOrderEd25519()
-      else if (sigScheme === 'secp256k1') data = await handlePlaceOrderEth()
-      else data = await handlePlaceOrderP256()
+      const data =
+        sigScheme === 'septic'
+          ? await handlePlaceOrderSeptic()
+          : await handlePlaceOrderEth()
+
+      if (!data) return
 
       if (data.success) {
         const cycles = data.execution_report?.total_instructions
-        const schemeLabels = { ed25519: 'Ed25519', secp256k1: 'secp256k1', p256: 'P-256' }
-        const scheme = schemeLabels[sigScheme]
-        setStatus(`Order proved (${scheme})! ${cycles ? cycles.toLocaleString() + ' instructions' : ''}`)
+        const scheme =
+          sigScheme === 'septic' ? 'Septic Schnorr' : 'secp256k1'
+        const signSuffix = data._signTimeMs
+          ? ` (sign: ${data._signTimeMs}ms)`
+          : ''
+        setStatus(
+          `Order proved (${scheme})! ${
+            cycles ? cycles.toLocaleString() + ' instructions' : ''
+          }${signSuffix}`,
+        )
         setIsError(false)
 
-        if (sigScheme === 'ed25519' && cycles) setEd25519Cycles(cycles)
+        if (sigScheme === 'septic' && cycles) setSepticCycles(cycles)
         if (sigScheme === 'secp256k1' && cycles) setSecp256k1Cycles(cycles)
-        if (sigScheme === 'p256' && cycles) setP256Cycles(cycles)
 
         setOrders((prev) => [
           {
@@ -255,13 +195,9 @@ export default function PlaceOrderComponent({ address }) {
     }
   }
 
-  const reductionVsEth =
-    ed25519Cycles && secp256k1Cycles
-      ? ((1 - ed25519Cycles / secp256k1Cycles) * 100).toFixed(1)
-      : null
-  const reductionVsP256 =
-    ed25519Cycles && p256Cycles
-      ? ((1 - ed25519Cycles / p256Cycles) * 100).toFixed(1)
+  const septicVsEth =
+    septicCycles && secp256k1Cycles
+      ? ((1 - septicCycles / secp256k1Cycles) * 100).toFixed(1)
       : null
 
   return (
@@ -274,12 +210,13 @@ export default function PlaceOrderComponent({ address }) {
           <input
             type="radio"
             name="sigScheme"
-            value="ed25519"
-            checked={sigScheme === 'ed25519'}
-            onChange={() => setSigScheme('ed25519')}
+            value="septic"
+            checked={sigScheme === 'septic'}
+            onChange={() => setSigScheme('septic')}
+            disabled={!wasmReady}
             style={styles.radio}
           />
-          Ed25519 (session key)
+          Septic Schnorr {wasmReady ? '(session key)' : '(loading WASM)'}
         </label>
         <label style={styles.radioLabel}>
           <input
@@ -291,17 +228,6 @@ export default function PlaceOrderComponent({ address }) {
             style={styles.radio}
           />
           Ethereum personal_sign
-        </label>
-        <label style={styles.radioLabel}>
-          <input
-            type="radio"
-            name="sigScheme"
-            value="p256"
-            checked={sigScheme === 'p256'}
-            onChange={() => setSigScheme('p256')}
-            style={styles.radio}
-          />
-          P-256 ECDSA
         </label>
       </div>
 
@@ -353,12 +279,12 @@ export default function PlaceOrderComponent({ address }) {
         </div>
       )}
 
-      {(ed25519Cycles || secp256k1Cycles || p256Cycles) && (
+      {(septicCycles || secp256k1Cycles) && (
         <div style={styles.benchmark}>
           <strong>Benchmark</strong>
-          {ed25519Cycles && (
+          {septicCycles && (
             <div style={styles.benchRow}>
-              Ed25519 + SHA-256: {ed25519Cycles.toLocaleString()} instructions
+              Septic Schnorr + Merkle: {septicCycles.toLocaleString()} instructions
             </div>
           )}
           {secp256k1Cycles && (
@@ -366,22 +292,10 @@ export default function PlaceOrderComponent({ address }) {
               secp256k1 + keccak256: {secp256k1Cycles.toLocaleString()} instructions
             </div>
           )}
-          {p256Cycles && (
-            <div style={styles.benchRow}>
-              P-256 + SHA-256: {p256Cycles.toLocaleString()} instructions
-            </div>
-          )}
-          {reductionVsEth && (
+          {septicVsEth && (
             <div style={styles.benchRow}>
               <span style={styles.reduction}>
-                Ed25519 vs secp256k1: {reductionVsEth}% reduction
-              </span>
-            </div>
-          )}
-          {reductionVsP256 && (
-            <div style={styles.benchRow}>
-              <span style={styles.reduction}>
-                Ed25519 vs P-256: {reductionVsP256}% reduction
+                Septic Schnorr vs secp256k1: {septicVsEth}% reduction
               </span>
             </div>
           )}

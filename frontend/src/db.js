@@ -1,6 +1,6 @@
 const DB_NAME = 'kalqix_poc'
 const STORE_NAME = 'session_keys'
-const DB_VERSION = 2
+const DB_VERSION = 3
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -10,7 +10,6 @@ function openDB() {
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME)
       }
-      // Delete old store from v1 if it exists
       if (db.objectStoreNames.contains('keys')) {
         db.deleteObjectStore('keys')
       }
@@ -20,25 +19,29 @@ function openDB() {
   })
 }
 
+function septicKey(address, keyIndex) {
+  return `kalqix_septic_${address.toLowerCase()}_${keyIndex}`
+}
+
 export async function loadKeyPair(address, keyIndex) {
   const db = await openDB()
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readonly')
     const store = tx.objectStore(STORE_NAME)
-    const req = store.get(`kalqix_ed25519_${address.toLowerCase()}_${keyIndex}`)
+    const req = store.get(septicKey(address, keyIndex))
     req.onsuccess = () => resolve(req.result || null)
     req.onerror = () => reject(req.error)
   })
 }
 
-export async function storeKeyPair(address, keyIndex, keyPair, pubKeyBytes, registered = false) {
+export async function storeKeyPair(address, keyIndex, { privLimbs, pubX, pubY, registered = false }) {
   const db = await openDB()
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite')
     const store = tx.objectStore(STORE_NAME)
     const req = store.put(
-      { keyPair, pubKey: pubKeyBytes, registered },
-      `kalqix_ed25519_${address.toLowerCase()}_${keyIndex}`
+      { privLimbs, pubX, pubY, registered },
+      septicKey(address, keyIndex),
     )
     req.onsuccess = () => resolve()
     req.onerror = () => reject(req.error)
@@ -47,32 +50,11 @@ export async function storeKeyPair(address, keyIndex, keyPair, pubKeyBytes, regi
 
 export async function markRegistered(address, keyIndex) {
   const record = await loadKeyPair(address, keyIndex)
-  if (record) {
-    await storeKeyPair(address, keyIndex, record.keyPair, record.pubKey, true)
-  }
-}
-
-export async function loadP256KeyPair(address) {
-  const db = await openDB()
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readonly')
-    const store = tx.objectStore(STORE_NAME)
-    const req = store.get(`kalqix_p256_${address.toLowerCase()}`)
-    req.onsuccess = () => resolve(req.result || null)
-    req.onerror = () => reject(req.error)
-  })
-}
-
-export async function storeP256KeyPair(address, keyPair, pubKeyBytes) {
-  const db = await openDB()
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readwrite')
-    const store = tx.objectStore(STORE_NAME)
-    const req = store.put(
-      { keyPair, pubKey: pubKeyBytes },
-      `kalqix_p256_${address.toLowerCase()}`
-    )
-    req.onsuccess = () => resolve()
-    req.onerror = () => reject(req.error)
+  if (!record) return
+  await storeKeyPair(address, keyIndex, {
+    privLimbs: record.privLimbs,
+    pubX: record.pubX,
+    pubY: record.pubY,
+    registered: true,
   })
 }

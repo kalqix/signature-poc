@@ -3,6 +3,7 @@ import WalletConnect from './WalletConnect.jsx'
 import RegisterKeyComponent from './RegisterKeyComponent.jsx'
 import PlaceOrderComponent from './PlaceOrderComponent.jsx'
 import { useState, useEffect } from 'react'
+import { initWasm } from './septic.js'
 
 const styles = {
   container: {
@@ -21,45 +22,28 @@ const styles = {
     border: '1px solid #333',
     borderRadius: 8,
   },
-  error: {
-    color: '#f66',
-    padding: 20,
-    textAlign: 'center',
+  warning: {
+    marginTop: 16,
+    padding: 12,
+    border: '1px solid #aa4',
+    borderRadius: 6,
+    background: '#221',
+    color: '#dd8',
+    fontSize: 13,
   },
-}
-
-async function checkEd25519Support() {
-  try {
-    await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign'])
-    return true
-  } catch {
-    return false
-  }
 }
 
 export default function App() {
   const { address, isConnected } = useAccount()
   const [keyRegistered, setKeyRegistered] = useState(false)
-  const [ed25519Supported, setEd25519Supported] = useState(null)
+  const [wasmReady, setWasmReady] = useState(false)
+  const [wasmError, setWasmError] = useState(null)
 
   useEffect(() => {
-    checkEd25519Support().then(setEd25519Supported)
+    initWasm()
+      .then(() => setWasmReady(true))
+      .catch((e) => setWasmError(e.message || String(e)))
   }, [])
-
-  if (ed25519Supported === null) return null
-
-  if (!ed25519Supported) {
-    return (
-      <div style={styles.container}>
-        <h1 style={styles.title}>KalqiX Signature POC</h1>
-        <div style={styles.error}>
-          Ed25519 Web Crypto not supported in this browser.
-          <br />
-          Use Chrome 113+ or Firefox 113+.
-        </div>
-      </div>
-    )
-  }
 
   return (
     <div style={styles.container}>
@@ -67,10 +51,19 @@ export default function App() {
 
       <WalletConnect />
 
+      {wasmError && (
+        <div style={styles.warning}>
+          Septic WASM failed to load: {wasmError}. Run{' '}
+          <code>wasm-pack build --target web --out-dir ../src/wasm-pkg</code>{' '}
+          in <code>frontend/wasm-signer</code>.
+        </div>
+      )}
+
       {isConnected && (
         <div style={styles.section}>
           <RegisterKeyComponent
             address={address}
+            wasmReady={wasmReady}
             onRegistered={() => setKeyRegistered(true)}
           />
         </div>
@@ -78,7 +71,7 @@ export default function App() {
 
       {isConnected && keyRegistered && (
         <div style={styles.section}>
-          <PlaceOrderComponent address={address} />
+          <PlaceOrderComponent address={address} wasmReady={wasmReady} />
         </div>
       )}
     </div>
