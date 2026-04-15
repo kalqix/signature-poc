@@ -1,12 +1,12 @@
 //! Profiling binary for SP1 cycle counting.
 //!
 //! Usage:
-//!   # All three proof types:
+//!   # All proof types:
 //!   TRACE_FILE=all.json cargo run --release --bin profile
 //!
 //!   # Single proof type:
 //!   TRACE_FILE=register.json cargo run --release --bin profile -- register-key
-//!   TRACE_FILE=order_ed.json cargo run --release --bin profile -- verify-order
+//!   TRACE_FILE=order.json cargo run --release --bin profile -- verify-order
 //!   TRACE_FILE=order_eth.json cargo run --release --bin profile -- verify-order-eth
 //!
 //!   # View in samply:
@@ -15,11 +15,9 @@
 use std::env;
 
 use anyhow::Result;
-use ed25519_dalek::Signer;
 use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey as Secp256k1SigningKey};
 use num_bigint::BigUint;
 use num_traits::Zero;
-use p256::ecdsa::SigningKey as P256SigningKey;
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use tiny_keccak::{Hasher, Keccak};
@@ -70,38 +68,119 @@ fn eth_sign(sk: &Secp256k1SigningKey, digest: &[u8; 32]) -> String {
     hex::encode(sig_bytes)
 }
 
+// ── Septic Schnorr helpers (host-side scalar arithmetic via num-bigint) ────
+
+fn group_order_biguint() -> BigUint {
+    BigUint::parse_bytes(
+        b"199372529839252601278447397890876471698671718266839763841250021879",
+        10,
+    )
+    .unwrap()
+}
+
+fn biguint_to_limbs(n: &BigUint) -> [u32; 8] {
+    let digits = n.to_u32_digits();
+    let mut limbs = [0u32; 8];
+    for (i, &d) in digits.iter().enumerate().take(8) {
+        limbs[i] = d;
+    }
+    limbs
+}
+
+fn random_scalar(r: &BigUint) -> BigUint {
+    let mut rng = OsRng;
+    loop {
+        let mut bytes = [0u8; 32];
+        rng.fill_bytes(&mut bytes);
+        let k = BigUint::from_bytes_le(&bytes) % r;
+        if !k.is_zero() {
+            return k;
+        }
+    }
+}
+
+/// Session-key pair: (private scalar, public point) on the septic curve.
+#[derive(Clone)]
+struct SessionPair {
+    priv_scalar: BigUint,
+    pubkey: SepticPoint,
+}
+
+fn make_session_pair() -> SessionPair {
+    let r = group_order_biguint();
+    let g = SepticPoint::generator();
+    let priv_scalar = random_scalar(&r);
+    let priv_limbs = biguint_to_limbs(&priv_scalar);
+    let pubkey = g.scalar_mul(&priv_limbs);
+    assert!(pubkey.on_curve(), "host-generated pubkey must be on curve");
+    SessionPair { priv_scalar, pubkey }
+}
+
+/// Schnorr-sign `msg_hash` with `session` and return (r_point, s_limbs, e_limbs).
+fn schnorr_sign(session: &SessionPair, msg_hash: &[u8; 32]) -> ([u32; 7], [u32; 7], [u32; 8], [u32; 8]) {
+    let r = group_order_biguint();
+    let g = SepticPoint::generator();
+
+    let k = random_scalar(&r);
+    let k_limbs = biguint_to_limbs(&k);
+    let r_point = g.scalar_mul(&k_limbs);
+
+    let mut challenge_input = Vec::with_capacity(28 + 28 + 32);
+    challenge_input.extend_from_slice(&r_point.x.to_bytes());
+    challenge_input.extend_from_slice(&session.pubkey.x.to_bytes());
+    challenge_input.extend_from_slice(msg_hash);
+    let e_hash = Sha256::digest(&challenge_input);
+    let e_biguint = BigUint::from_bytes_be(&e_hash) % &r;
+    let e_limbs = biguint_to_limbs(&e_biguint);
+
+    let ea = (&e_biguint * &session.priv_scalar) % &r;
+    let s_biguint = if k >= ea {
+        (&k - &ea) % &r
+    } else {
+        (&k + &r - &ea) % &r
+    };
+    let s_limbs = biguint_to_limbs(&s_biguint);
+
+    // Host-side sanity: s*G + e*A == R
+    let s_g = g.scalar_mul(&s_limbs);
+    let e_a = session.pubkey.scalar_mul(&e_limbs);
+    let sum = s_g.add(&e_a);
+    assert!(
+        !sum.is_infinity && sum.x == r_point.x && sum.y == r_point.y,
+        "host-side Schnorr self-check failed"
+    );
+
+    (r_point.x.0, r_point.y.0, s_limbs, e_limbs)
+}
+
 struct TestFixtures {
     eth_sk: Secp256k1SigningKey,
     address: [u8; 20],
-    ed_sk: ed25519_dalek::SigningKey,
-    ed_pk: ed25519_dalek::VerifyingKey,
-    p256_sk: P256SigningKey,
-    p256_pk_hex: String,
+    session: SessionPair,
 }
 
 impl TestFixtures {
     fn new() -> Self {
         let eth_sk = Secp256k1SigningKey::random(&mut OsRng);
         let address = eth_address_from_key(&eth_sk);
-        let ed_sk = ed25519_dalek::SigningKey::generate(&mut OsRng);
-        let ed_pk = ed_sk.verifying_key();
-        let p256_sk = P256SigningKey::random(&mut OsRng);
-        let p256_pk_hex = hex::encode(p256_sk.verifying_key().to_sec1_bytes());
-        Self { eth_sk, address, ed_sk, ed_pk, p256_sk, p256_pk_hex }
+        let session = make_session_pair();
+        Self { eth_sk, address, session }
     }
 }
 
 fn build_register_key_input(fix: &TestFixtures, app: &mut AppState) -> ProgramInput {
-    let pubkey_hex = hex::encode(fix.ed_pk.as_bytes());
+    let pubkey_x = fix.session.pubkey.x.0;
+    let pubkey_y = fix.session.pubkey.y.0;
     let key = SessionKey {
-        pubkey: *fix.ed_pk.as_bytes(),
+        pubkey_x,
+        pubkey_y,
         key_index: 0,
     };
 
     let (old_leaf_hash, old_root, new_root, siblings, leaf_index) =
         app.register_key(fix.address, key);
 
-    let message = register_key_message(&fix.address, fix.ed_pk.as_bytes(), 0);
+    let message = register_key_message(&fix.address, &pubkey_x, &pubkey_y, 0);
     let digest = eip191_hash(&message);
     let eth_sig_hex = eth_sign(&fix.eth_sk, &digest);
 
@@ -109,7 +188,8 @@ fn build_register_key_input(fix: &TestFixtures, app: &mut AppState) -> ProgramIn
         request: RegisterKeyRequest {
             account_address: fix.address,
             key_index: 0,
-            pubkey_hex,
+            pubkey_x,
+            pubkey_y,
             eth_signature_hex: eth_sig_hex,
         },
         old_leaf_hash,
@@ -130,11 +210,8 @@ fn build_verify_order_input(fix: &TestFixtures, app: &AppState) -> ProgramInput 
         "ETH/USDC:BUY:2000000:100:{}",
         hex::encode(fix.address)
     );
-    let msg_bytes = order_msg_str.as_bytes();
-    let hash = Sha256::digest(msg_bytes);
-
-    let sig = fix.ed_sk.sign(&hash);
-    let sig_hex = hex::encode(sig.to_bytes());
+    let msg_hash: [u8; 32] = Sha256::digest(order_msg_str.as_bytes()).into();
+    let (r_x, r_y, s_limbs, e_limbs) = schnorr_sign(&fix.session, &msg_hash);
 
     let order = SignedOrder {
         account_address: fix.address,
@@ -143,7 +220,10 @@ fn build_verify_order_input(fix: &TestFixtures, app: &AppState) -> ProgramInput 
         side: "BUY".to_string(),
         price: 2000000,
         quantity: 100,
-        ed25519_signature_hex: sig_hex,
+        signature_r_x: r_x,
+        signature_r_y: r_y,
+        signature_s: s_limbs,
+        challenge_e: e_limbs,
     };
 
     ProgramInput::VerifyOrder(OrderWitness {
@@ -176,106 +256,19 @@ fn build_verify_order_eth_input(fix: &TestFixtures) -> ProgramInput {
     ProgramInput::VerifyOrderEth(EthOrderWitness { order })
 }
 
-fn build_verify_order_p256_input(fix: &TestFixtures) -> ProgramInput {
-    let order_msg = format!(
-        "ETH/USDC:BUY:2000000:100:{}",
-        hex::encode(fix.address)
-    );
-    let hash = Sha256::digest(order_msg.as_bytes());
-    let (sig, _): (p256::ecdsa::Signature, _) = fix.p256_sk.sign_prehash(&hash).expect("p256 sign failed");
-    let sig_hex = hex::encode(sig.to_bytes());
+fn build_verify_order_septic_input(fix: &TestFixtures, app: &AppState) -> ProgramInput {
+    // Reuse the registered key's Merkle proof so this path is apples-to-apples
+    // with `build_verify_order_input` (same tree, same session key, same
+    // siblings) — only the scalar-mul strategy in the guest differs.
+    let (_session_key, siblings, leaf_index) = app
+        .get_key_proof(fix.address, 0)
+        .expect("key not registered — call build_register_key_input first");
+    let root = app.current_root;
 
-    let order = P256SignedOrder {
-        account_address: fix.address,
-        key_index: 0,
-        market: "ETH/USDC".to_string(),
-        side: "BUY".to_string(),
-        price: 2000000,
-        quantity: 100,
-        p256_signature_hex: sig_hex,
-        p256_pubkey_hex: fix.p256_pk_hex.clone(),
-    };
-
-    ProgramInput::VerifyOrderP256(P256OrderWitness { order })
-}
-
-// ── Septic Schnorr helpers (host-side scalar arithmetic via num-bigint) ────
-
-fn group_order_biguint() -> BigUint {
-    BigUint::parse_bytes(
-        b"199372529839252601278447397890876471698671718266839763841250021879",
-        10,
-    )
-    .unwrap()
-}
-
-fn biguint_to_limbs(n: &BigUint) -> [u32; 8] {
-    let digits = n.to_u32_digits();
-    let mut limbs = [0u32; 8];
-    for (i, &d) in digits.iter().enumerate().take(8) {
-        limbs[i] = d;
-    }
-    limbs
-}
-
-fn random_scalar(r: &BigUint) -> BigUint {
-    let mut rng = OsRng;
-    loop {
-        let mut bytes = [0u8; 32];
-        rng.fill_bytes(&mut bytes);
-        let k = BigUint::from_bytes_le(&bytes) % r;
-        if !k.is_zero() {
-            return k;
-        }
-    }
-}
-
-fn build_verify_order_septic_input(fix: &TestFixtures) -> ProgramInput {
-    let r = group_order_biguint();
-    let g = SepticPoint::generator();
-
-    // Key pair: private scalar a, public point A = a*G
-    let a_scalar = random_scalar(&r);
-    let a_limbs = biguint_to_limbs(&a_scalar);
-    let pubkey = g.scalar_mul(&a_limbs);
-    assert!(pubkey.on_curve(), "host-generated pubkey must be on curve");
-
-    // Message hash
     let order_msg = format!("ETH/USDC:BUY:2000000:100:{}", hex::encode(fix.address));
-    let msg_hash = Sha256::digest(order_msg.as_bytes());
+    let msg_hash: [u8; 32] = Sha256::digest(order_msg.as_bytes()).into();
 
-    // Nonce and commitment: k random, R = k*G
-    let k = random_scalar(&r);
-    let k_limbs = biguint_to_limbs(&k);
-    let r_point = g.scalar_mul(&k_limbs);
-    assert!(r_point.on_curve(), "host-generated R must be on curve");
-
-    // Challenge e = SHA256(R_x || A_x || msg_hash) mod r
-    let mut challenge_input = Vec::with_capacity(28 + 28 + 32);
-    challenge_input.extend_from_slice(&r_point.x.to_bytes());
-    challenge_input.extend_from_slice(&pubkey.x.to_bytes());
-    challenge_input.extend_from_slice(&msg_hash);
-    let e_hash = Sha256::digest(&challenge_input);
-    let e_biguint = BigUint::from_bytes_be(&e_hash) % &r;
-    let e_limbs = biguint_to_limbs(&e_biguint);
-
-    // s = (k - e*a) mod r
-    let ea = (&e_biguint * &a_scalar) % &r;
-    let s_biguint = if k >= ea {
-        (&k - &ea) % &r
-    } else {
-        (&k + &r - &ea) % &r
-    };
-    let s_limbs = biguint_to_limbs(&s_biguint);
-
-    // Host-side sanity: s*G + e*A == R
-    let s_g = g.scalar_mul(&s_limbs);
-    let e_a = pubkey.scalar_mul(&e_limbs);
-    let sum = s_g.add(&e_a);
-    assert!(
-        !sum.is_infinity && sum.x == r_point.x && sum.y == r_point.y,
-        "host-side Schnorr self-check failed"
-    );
+    let (r_x, r_y, s_limbs, e_limbs) = schnorr_sign(&fix.session, &msg_hash);
 
     let order = SepticSchnorrOrder {
         account_address: fix.address,
@@ -285,17 +278,24 @@ fn build_verify_order_septic_input(fix: &TestFixtures) -> ProgramInput {
         price: 2000000,
         quantity: 100,
         signature: SepticSchnorrSignature {
-            r_x: r_point.x,
-            r_y: r_point.y,
+            r_x: shared::septic::Fp7(r_x),
+            r_y: shared::septic::Fp7(r_y),
             s: s_limbs,
         },
-        pubkey_x: pubkey.x,
-        pubkey_y: pubkey.y,
+        pubkey_x: fix.session.pubkey.x,
+        pubkey_y: fix.session.pubkey.y,
     };
 
-    ProgramInput::VerifyOrderSeptic(SepticBenchWitness {
+    let bench = SepticBenchWitness {
         order,
         challenge_e: e_limbs,
+    };
+
+    ProgramInput::VerifyOrderSeptic(VerifyOrderSepticWitness {
+        bench,
+        session_key_root: root,
+        merkle_siblings: siblings,
+        leaf_index,
     })
 }
 
@@ -367,8 +367,6 @@ fn build_batch_septic_input(fix: &TestFixtures, count: usize) -> ProgramInput {
 }
 
 fn build_batch_septic_opt_input(fix: &TestFixtures, count: usize) -> ProgramInput {
-    // Witness data is identical to the naive batch — only the verification
-    // algorithm inside the guest differs.
     match build_batch_septic_input(fix, count) {
         ProgramInput::BatchSeptic(w) => {
             ProgramInput::BatchSepticOpt(BatchSepticOptWitness { orders: w.orders })
@@ -404,6 +402,233 @@ fn build_batch_septic_verify_input(fix: &TestFixtures, count: usize) -> ProgramI
     }
 }
 
+// ── Large-depth in-memory Merkle tree for the dedup benchmark ──────────────
+
+/// A Merkle tree built once over `1 << depth` leaves, with all internal nodes
+/// cached so per-leaf sibling lookups are O(depth). Uses the same Poseidon2
+/// byte hash as the production state tree so proofs are guest-verifiable.
+struct BenchTree {
+    depth: usize,
+    levels: Vec<Vec<[u8; 32]>>, // levels[0] = leaves, levels[depth] = [root]
+}
+
+fn bench_hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut combined = [0u8; 64];
+    combined[..32].copy_from_slice(left);
+    combined[32..].copy_from_slice(right);
+    state::poseidon2_hash_bytes(&combined)
+}
+
+impl BenchTree {
+    fn new(depth: usize, leaves: Vec<[u8; 32]>) -> Self {
+        assert_eq!(leaves.len(), 1usize << depth, "leaves must be 2^depth");
+        let mut levels = Vec::with_capacity(depth + 1);
+        levels.push(leaves);
+        for level in 0..depth {
+            let prev = &levels[level];
+            let mut next = Vec::with_capacity(prev.len() / 2);
+            for pair in prev.chunks_exact(2) {
+                next.push(bench_hash_pair(&pair[0], &pair[1]));
+            }
+            levels.push(next);
+        }
+        Self { depth, levels }
+    }
+
+    fn root(&self) -> [u8; 32] {
+        self.levels[self.depth][0]
+    }
+
+    fn siblings(&self, leaf_index: u64) -> Vec<[u8; 32]> {
+        let mut siblings = Vec::with_capacity(self.depth);
+        let mut idx = leaf_index as usize;
+        for level in 0..self.depth {
+            siblings.push(self.levels[level][idx ^ 1]);
+            idx /= 2;
+        }
+        siblings
+    }
+}
+
+/// Build a deduped batch: `count` total orders signed by ~`(1 - repetition_ratio) × count`
+/// unique session keys. Each unique key is registered into a fresh in-memory
+/// tree (depth chosen to fit), and orders are randomly distributed across keys
+/// — first `unique_count` orders introduce a fresh key, remaining orders
+/// re-use a previously-introduced key (then the order list is shuffled).
+fn build_batch_septic_dedup_input(count: usize, repetition_ratio: f64) -> ProgramInput {
+    use rand::seq::SliceRandom;
+    use rand::Rng;
+
+    assert!((0.0..=1.0).contains(&repetition_ratio), "ratio must be in [0, 1]");
+    let unique_count = (((count as f64) * (1.0 - repetition_ratio)).ceil() as usize).max(1);
+
+    // Tree depth large enough to hold all unique keys (next power of two).
+    let mut depth = 1usize;
+    while (1usize << depth) < unique_count {
+        depth += 1;
+    }
+    let num_leaves = 1usize << depth;
+
+    println!(
+        "  Dedup config: {} orders, {} unique keys ({:.0}% repetition), tree depth {} ({} leaves)",
+        count,
+        unique_count,
+        repetition_ratio * 100.0,
+        depth,
+        num_leaves
+    );
+
+    // 1. Generate `unique_count` session pairs + synthetic addresses.
+    let mut session_pairs: Vec<(SessionPair, [u8; 20], u8, u64)> = Vec::with_capacity(unique_count);
+    let mut leaf_hashes = vec![[0u8; 32]; num_leaves];
+
+    for i in 0..unique_count {
+        let session = make_session_pair();
+        // Synthetic per-key address — register-key is not used in this benchmark.
+        let mut address = [0u8; 20];
+        address[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        let key_index = 0u8;
+
+        let leaf = SessionKeyLeaf {
+            account_address: address,
+            key_index,
+            pubkey_x: session.pubkey.x.0,
+            pubkey_y: session.pubkey.y.0,
+        };
+        let leaf_hash = state::poseidon2_hash_bytes(&bincode::serialize(&leaf).unwrap());
+        leaf_hashes[i] = leaf_hash;
+
+        session_pairs.push((session, address, key_index, i as u64));
+
+        if unique_count >= 500 && (i + 1) % 500 == 0 {
+            println!("  generated {}/{} unique keys", i + 1, unique_count);
+        }
+    }
+
+    // 2. Build the bench tree once, then pull siblings per unique key.
+    let tree = BenchTree::new(depth, leaf_hashes);
+    let root = tree.root();
+
+    let unique_keys: Vec<DedupKey> = session_pairs
+        .iter()
+        .map(|(session, address, key_index, leaf_index)| DedupKey {
+            account_address: *address,
+            key_index: *key_index,
+            pubkey_x: session.pubkey.x.0,
+            pubkey_y: session.pubkey.y.0,
+            merkle_siblings: tree.siblings(*leaf_index),
+            leaf_index: *leaf_index,
+        })
+        .collect();
+
+    // 3. Generate `count` orders. First `unique_count` use distinct keys;
+    //    remainder pick a previously-used key at random.
+    let mut rng = rand::rngs::OsRng;
+    let mut orders = Vec::with_capacity(count);
+    for i in 0..count {
+        let key_idx: usize = if i < unique_count {
+            i
+        } else {
+            rng.gen_range(0..unique_count)
+        };
+        let (session, address, _key_index, _leaf_index) = &session_pairs[key_idx];
+        let order_msg = format!(
+            "ETH/USDC:BUY:{}:{}:{}",
+            2000000 + i,
+            100 + (i % 50),
+            hex::encode(address)
+        );
+        let msg_hash: [u8; 32] = Sha256::digest(order_msg.as_bytes()).into();
+        let (r_x, r_y, s_limbs, e_limbs) = schnorr_sign(session, &msg_hash);
+
+        orders.push(DedupOrder {
+            key_idx: key_idx as u32,
+            market: "ETH/USDC".to_string(),
+            side: "BUY".to_string(),
+            price: 2000000 + i as u64,
+            quantity: 100 + (i % 50) as u64,
+            signature_r_x: r_x,
+            signature_r_y: r_y,
+            signature_s: s_limbs,
+            challenge_e: e_limbs,
+        });
+
+        if count >= 500 && (i + 1) % 500 == 0 {
+            println!("  generated {}/{} orders", i + 1, count);
+        }
+    }
+
+    // Shuffle so reused keys aren't all clustered at the end.
+    orders.shuffle(&mut rng);
+
+    ProgramInput::BatchSepticDedup(BatchSepticDedupWitness {
+        unique_keys,
+        orders,
+        session_key_root: root,
+    })
+}
+
+/// Build a Merkle-checked batch using one already-registered session key.
+/// All `count` orders share the same Merkle proof — same key, same tree
+/// snapshot, same root. Per-order Merkle work in the guest is identical
+/// regardless of whether siblings are unique or duplicated.
+fn build_batch_septic_verify_merkle_input(
+    fix: &TestFixtures,
+    app: &AppState,
+    count: usize,
+) -> ProgramInput {
+    let (_key, siblings, leaf_index) = app
+        .get_key_proof(fix.address, 0)
+        .expect("key not registered — call build_register_key_input first");
+    let root = app.current_root;
+
+    let mut orders = Vec::with_capacity(count);
+    for i in 0..count {
+        let order_msg = format!(
+            "ETH/USDC:BUY:{}:{}:{}",
+            2000000 + i,
+            100 + (i % 50),
+            hex::encode(fix.address)
+        );
+        let msg_hash: [u8; 32] = Sha256::digest(order_msg.as_bytes()).into();
+        let (r_x, r_y, s_limbs, e_limbs) = schnorr_sign(&fix.session, &msg_hash);
+
+        let order = SepticSchnorrOrder {
+            account_address: fix.address,
+            key_index: 0,
+            market: "ETH/USDC".to_string(),
+            side: "BUY".to_string(),
+            price: 2000000 + i as u64,
+            quantity: 100 + (i % 50) as u64,
+            signature: SepticSchnorrSignature {
+                r_x: shared::septic::Fp7(r_x),
+                r_y: shared::septic::Fp7(r_y),
+                s: s_limbs,
+            },
+            pubkey_x: fix.session.pubkey.x,
+            pubkey_y: fix.session.pubkey.y,
+        };
+        let bench = SepticBenchWitness {
+            order,
+            challenge_e: e_limbs,
+        };
+        orders.push(SepticMerkleOrder {
+            bench,
+            merkle_siblings: siblings.clone(),
+            leaf_index,
+        });
+
+        if count >= 500 && (i + 1) % 500 == 0 {
+            println!("  generated {}/{}", i + 1, count);
+        }
+    }
+
+    ProgramInput::BatchSepticVerifyMerkle(BatchSepticVerifyMerkleWitness {
+        orders,
+        session_key_root: root,
+    })
+}
+
 fn build_batch_eth_input(fix: &TestFixtures, count: usize) -> ProgramInput {
     let mut orders = Vec::with_capacity(count);
     for i in 0..count {
@@ -433,10 +658,6 @@ fn build_batch_eth_input(fix: &TestFixtures, count: usize) -> ProgramInput {
 }
 
 /// Bench host-side signature generation (excluding key generation).
-///
-/// For each scheme, a keypair is generated once up front, then `count`
-/// fresh signatures are produced over distinct messages. Only the signing
-/// loop is timed.
 fn bench_signing(fix: &TestFixtures, count: usize) {
     use std::time::Instant;
 
@@ -444,7 +665,6 @@ fn bench_signing(fix: &TestFixtures, count: usize) {
     println!("  Host signing benchmark (count = {count}, key generation excluded)");
     println!("============================================================");
 
-    // ── Septic Schnorr: generate key pair once, outside the timed section. ──
     let r = group_order_biguint();
     let g = SepticPoint::generator();
     let a_scalar = random_scalar(&r);
@@ -461,12 +681,10 @@ fn bench_signing(fix: &TestFixtures, count: usize) {
         );
         let msg_hash = Sha256::digest(order_msg.as_bytes());
 
-        // Nonce + commitment.
         let k = random_scalar(&r);
         let k_limbs = biguint_to_limbs(&k);
         let r_point = g.scalar_mul(&k_limbs);
 
-        // Challenge.
         let mut challenge_input = Vec::with_capacity(28 + 28 + 32);
         challenge_input.extend_from_slice(&r_point.x.to_bytes());
         challenge_input.extend_from_slice(&septic_pubkey.x.to_bytes());
@@ -474,7 +692,6 @@ fn bench_signing(fix: &TestFixtures, count: usize) {
         let e_hash = Sha256::digest(&challenge_input);
         let e_biguint = BigUint::from_bytes_be(&e_hash) % &r;
 
-        // Response s = (k - e·a) mod r.
         let ea = (&e_biguint * &a_scalar) % &r;
         let _s = if k >= ea {
             (&k - &ea) % &r
@@ -482,14 +699,12 @@ fn bench_signing(fix: &TestFixtures, count: usize) {
             (&k + &r - &ea) % &r
         };
 
-        // Silence the optimizer.
         std::hint::black_box(&r_point);
         std::hint::black_box(&_s);
     }
     let septic_total = start.elapsed();
     let septic_per_sig = septic_total / count as u32;
 
-    // ── secp256k1 ECDSA: fix.eth_sk already generated in TestFixtures. ──
     let start = Instant::now();
     for i in 0..count {
         let order_msg = format!(
@@ -558,8 +773,6 @@ async fn run_and_report(label: &str, input: ProgramInput, elf: &[u8]) -> Result<
         for (name, cycles) in entries {
             let pct = (*cycles as f64 / total as f64) * 100.0;
             let gas_est_str = match gas_opt {
-                // Pro-rata by cycle share — SP1 doesn't track gas per section,
-                // so this is a proportional estimate, not a measured value.
                 Some(total_gas) => {
                     let est = (*cycles as u128 * total_gas as u128 / total as u128) as u64;
                     format!("{est}")
@@ -592,19 +805,41 @@ async fn main() -> Result<()> {
             // Must register first to have a Merkle proof
             let _ = build_register_key_input(&fix, &mut app);
             let input = build_verify_order_input(&fix, &app);
-            run_and_report("VerifyOrder (Ed25519)", input, ELF).await?;
+            run_and_report("VerifyOrder (Septic Schnorr + Merkle)", input, ELF).await?;
         }
         Some("verify-order-eth") => {
             let input = build_verify_order_eth_input(&fix);
             run_and_report("VerifyOrderEth (secp256k1)", input, ELF).await?;
         }
-        Some("verify-order-p256") => {
-            let input = build_verify_order_p256_input(&fix);
-            run_and_report("VerifyOrderP256 (P-256)", input, ELF).await?;
-        }
         Some("verify-order-septic") => {
-            let input = build_verify_order_septic_input(&fix);
-            run_and_report("VerifyOrderSeptic (Schnorr/Fp7)", input, ELF).await?;
+            // Register the key first so the Merkle proof is well-formed.
+            let _ = build_register_key_input(&fix, &mut app);
+            let input = build_verify_order_septic_input(&fix, &app);
+            run_and_report("VerifyOrderSeptic (Schnorr/Fp7 + Merkle, per-bit scalar_mul)", input, ELF).await?;
+        }
+        Some("batch-septic-1") => {
+            let input = build_batch_septic_input(&fix, 1);
+            run_and_report("BatchSeptic (1 Schnorr)", input, ELF).await?;
+        }
+        Some("batch-septic-opt-1") => {
+            let input = build_batch_septic_opt_input(&fix, 1);
+            run_and_report("BatchSepticOpt (1 batch Schnorr)", input, ELF).await?;
+        }
+        Some("batch-septic-single-1") => {
+            let input = build_batch_septic_single_input(&fix, 1);
+            run_and_report("BatchSepticSingle (1 naive/single-syscall)", input, ELF).await?;
+        }
+        Some("batch-septic-opt-single-1") => {
+            let input = build_batch_septic_opt_single_input(&fix, 1);
+            run_and_report("BatchSepticOptSingle (1 batch-Schnorr/single-syscall)", input, ELF).await?;
+        }
+        Some("batch-septic-verify-1") => {
+            let input = build_batch_septic_verify_input(&fix, 1);
+            run_and_report("BatchSepticVerify (1 Shamir)", input, ELF).await?;
+        }
+        Some("batch-eth-1") => {
+            let input = build_batch_eth_input(&fix, 1);
+            run_and_report("BatchEth (1 ecrecover)", input, ELF).await?;
         }
         Some("batch-septic-10") => {
             let input = build_batch_septic_input(&fix, 10);
@@ -675,6 +910,88 @@ async fn main() -> Result<()> {
             let input = build_batch_eth_input(&fix, 4000);
             run_and_report("BatchEth (4000 ecrecover)", input, ELF).await?;
         }
+        Some("batch-septic-6000") => {
+            println!("\nGenerating 6000 septic Schnorr signatures (host-side, may take a few minutes)...");
+            let input = build_batch_septic_input(&fix, 6000);
+            run_and_report("BatchSeptic (6000 Schnorr)", input, ELF).await?;
+        }
+        Some("batch-septic-opt-6000") => {
+            println!("\nGenerating 6000 septic signatures for batch Schnorr (host-side)...");
+            let input = build_batch_septic_opt_input(&fix, 6000);
+            run_and_report("BatchSepticOpt (6000 batch Schnorr)", input, ELF).await?;
+        }
+        Some("batch-septic-single-6000") => {
+            println!("\nGenerating 6000 septic signatures for naive single-syscall (host-side)...");
+            let input = build_batch_septic_single_input(&fix, 6000);
+            run_and_report("BatchSepticSingle (6000 naive/single-syscall)", input, ELF).await?;
+        }
+        Some("batch-septic-opt-single-6000") => {
+            println!("\nGenerating 6000 septic signatures for batch Schnorr single-syscall (host-side)...");
+            let input = build_batch_septic_opt_single_input(&fix, 6000);
+            run_and_report("BatchSepticOptSingle (6000 batch-Schnorr/single-syscall)", input, ELF).await?;
+        }
+        Some("batch-septic-verify-6000") => {
+            println!("\nGenerating 6000 septic signatures for Shamir verify (host-side)...");
+            let input = build_batch_septic_verify_input(&fix, 6000);
+            run_and_report("BatchSepticVerify (6000 Shamir)", input, ELF).await?;
+        }
+        Some("batch-eth-6000") => {
+            println!("\nGenerating 6000 secp256k1 signatures (host-side)...");
+            let input = build_batch_eth_input(&fix, 6000);
+            run_and_report("BatchEth (6000 ecrecover)", input, ELF).await?;
+        }
+        Some("batch-septic-verify-merkle-1") => {
+            let _ = build_register_key_input(&fix, &mut app);
+            let input = build_batch_septic_verify_merkle_input(&fix, &app, 1);
+            run_and_report("BatchSepticVerifyMerkle (1 Shamir + Merkle)", input, ELF).await?;
+        }
+        Some("batch-septic-verify-merkle-10") => {
+            let _ = build_register_key_input(&fix, &mut app);
+            let input = build_batch_septic_verify_merkle_input(&fix, &app, 10);
+            run_and_report("BatchSepticVerifyMerkle (10 Shamir + Merkle)", input, ELF).await?;
+        }
+        Some("batch-septic-verify-merkle-2000") => {
+            let _ = build_register_key_input(&fix, &mut app);
+            println!("\nGenerating 2000 septic Schnorr + Merkle witnesses (host-side)...");
+            let input = build_batch_septic_verify_merkle_input(&fix, &app, 2000);
+            run_and_report("BatchSepticVerifyMerkle (2000 Shamir + Merkle)", input, ELF).await?;
+        }
+        Some("batch-septic-verify-merkle-6000") => {
+            let _ = build_register_key_input(&fix, &mut app);
+            println!("\nGenerating 6000 septic Schnorr + Merkle witnesses (host-side)...");
+            let input = build_batch_septic_verify_merkle_input(&fix, &app, 6000);
+            run_and_report("BatchSepticVerifyMerkle (6000 Shamir + Merkle)", input, ELF).await?;
+        }
+        Some(s) if s.starts_with("batch-septic-dedup-") => {
+            // Mode form: `batch-septic-dedup-<count>` with optional second arg
+            // = repetition ratio in [0, 1] (default 0.2). Examples:
+            //   batch-septic-dedup-6000          → 6000 orders, 20% repeat
+            //   batch-septic-dedup-6000 0.5      → 6000 orders, 50% repeat
+            let count: usize = s
+                .trim_start_matches("batch-septic-dedup-")
+                .parse()
+                .expect("expected batch-septic-dedup-<count>");
+            let ratio: f64 = args
+                .get(2)
+                .map(|s| s.parse().expect("ratio must be a number in [0, 1]"))
+                .unwrap_or(0.2);
+            println!(
+                "\nGenerating {} deduped septic witnesses ({:.0}% repetition)...",
+                count,
+                ratio * 100.0
+            );
+            let input = build_batch_septic_dedup_input(count, ratio);
+            run_and_report(
+                &format!(
+                    "BatchSepticDedup ({} orders, {:.0}% repeat)",
+                    count,
+                    ratio * 100.0
+                ),
+                input,
+                ELF,
+            )
+            .await?;
+        }
         Some("bench-sign") => {
             bench_signing(&fix, 2000);
         }
@@ -684,19 +1001,21 @@ async fn main() -> Result<()> {
             run_and_report("RegisterKey", reg_input, ELF).await?;
 
             let order_input = build_verify_order_input(&fix, &app);
-            run_and_report("VerifyOrder (Ed25519)", order_input, ELF).await?;
+            run_and_report("VerifyOrder (Septic Schnorr + Merkle)", order_input, ELF).await?;
 
             let eth_input = build_verify_order_eth_input(&fix);
             run_and_report("VerifyOrderEth (secp256k1)", eth_input, ELF).await?;
 
-            let p256_input = build_verify_order_p256_input(&fix);
-            run_and_report("VerifyOrderP256 (P-256)", p256_input, ELF).await?;
-
-            let septic_input = build_verify_order_septic_input(&fix);
-            run_and_report("VerifyOrderSeptic (Schnorr/Fp7)", septic_input, ELF).await?;
+            let septic_input = build_verify_order_septic_input(&fix, &app);
+            run_and_report(
+                "VerifyOrderSeptic (Schnorr/Fp7 + Merkle, per-bit scalar_mul)",
+                septic_input,
+                ELF,
+            )
+            .await?;
 
             println!("\n============================================================");
-            println!("  Done. Compare VerifyOrder vs VerifyOrderEth vs VerifyOrderP256 vs VerifyOrderSeptic totals above.");
+            println!("  Done. Compare VerifyOrder vs VerifyOrderEth vs VerifyOrderSeptic totals above.");
             println!("============================================================");
         }
     }

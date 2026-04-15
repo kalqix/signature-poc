@@ -1,9 +1,13 @@
 # Rust
 /target/
+frontend/wasm-signer/target/
 
 # Node
 frontend/node_modules/
 frontend/dist/
+
+# wasm-pack output (regenerated from frontend/wasm-signer)
+frontend/src/wasm-pkg/
 
 # SP1 ELF binary (rebuilt with cargo prove build)
 program/elf/riscv32im-succinct-zkvm-elf
