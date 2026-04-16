@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use jmt::flat_proof::FlatBatchExistenceProof;
 use jmt::proof::SparseMerkleProof;
 use jmt::BatchExistenceProof;
 
@@ -247,6 +248,27 @@ pub struct BatchSepticDedupBatchWitness {
     pub orders: Vec<DedupOrder>,
 }
 
+/// Same dedup shape as `BatchSepticDedupBatchWitness`, but swaps
+/// `BatchExistenceProof` for `FlatBatchExistenceProof` — siblings are
+/// pre-hashed on the host so verification does one Poseidon2 call per
+/// tree level instead of two. Expected ~50% cut in Merkle cycles on
+/// top of the rkyv zero-copy deserialize win.
+#[derive(
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Clone,
+    Debug,
+)]
+pub struct BatchSepticDedupFlatWitness {
+    pub session_key_root: [u8; 32],
+    pub flat_proof: FlatBatchExistenceProof,
+    pub unique_keys: Vec<UniqueKeyInfo>,
+    pub orders: Vec<DedupOrder>,
+}
+
 #[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize, Clone, Debug)]
 pub struct BatchEthWitness {
     pub orders: Vec<EthOrderWitness>,
@@ -283,6 +305,10 @@ pub enum ProgramInput {
     /// The guest reads an additional rkyv-encoded `BatchSepticDedupBatchWitness`
     /// from the next `read_vec()` call and accesses it zero-copy.
     BatchSepticDedupRkyv,
+    /// Unit variant — same wire shape as `BatchSepticDedupRkyv`: borsh tag in
+    /// the first stdin chunk, then a rkyv-encoded `BatchSepticDedupFlatWitness`
+    /// in the next `read_vec()`, accessed zero-copy.
+    BatchSepticDedupFlat,
     BatchEth(BatchEthWitness),
 }
 

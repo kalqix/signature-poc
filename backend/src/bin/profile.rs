@@ -36,6 +36,30 @@ use state::AppState;
 
 const ELF: &[u8] = include_bytes!("../../../program/elf/signature-poc");
 
+/// Parse `<prefix><unique>-<orders>` (e.g. `batch-dedup-flat-200-6000`)
+/// into `(unique_count, order_count)`. Panics with a helpful message on
+/// malformed inputs — this is a CLI-only parser and bad args are user error.
+fn parse_unique_orders_suffix(mode: &str, prefix: &str) -> (usize, usize) {
+    let rest = mode
+        .strip_prefix(prefix)
+        .unwrap_or_else(|| panic!("mode {mode:?} does not start with {prefix:?}"));
+    let (unique_str, orders_str) = rest
+        .split_once('-')
+        .unwrap_or_else(|| panic!("expected `<unique>-<orders>` after prefix in {mode:?}"));
+    let unique: usize = unique_str
+        .parse()
+        .unwrap_or_else(|_| panic!("unique count {unique_str:?} is not a positive integer"));
+    let orders: usize = orders_str
+        .parse()
+        .unwrap_or_else(|_| panic!("order count {orders_str:?} is not a positive integer"));
+    assert!(unique >= 1, "unique count must be >= 1");
+    assert!(
+        unique <= orders,
+        "unique count ({unique}) must be <= order count ({orders})"
+    );
+    (unique, orders)
+}
+
 fn keccak256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Keccak::v256();
     hasher.update(data);
@@ -714,6 +738,29 @@ fn build_batch_septic_dedup_batch_input(
     ))
 }
 
+/// Same tree/key/order distribution as `build_batch_septic_dedup_batch_witness`,
+/// but the JMT witness is a `FlatBatchExistenceProof` (siblings pre-hashed on
+/// the host). Cycle-count deltas against the BatchExistence+rkyv path isolate
+/// the flat-sibling win.
+fn build_batch_septic_dedup_flat_witness(
+    count: usize,
+    unique_count: usize,
+    tree_size: usize,
+) -> shared::BatchSepticDedupFlatWitness {
+    use jmt::flat_proof::FlatBatchExistenceProof;
+    use shared::Poseidon2Hasher;
+
+    let base = build_batch_septic_dedup_batch_witness(count, unique_count, tree_size);
+    let flat_proof = FlatBatchExistenceProof::from_batch::<Poseidon2Hasher>(&base.batch_proof);
+
+    shared::BatchSepticDedupFlatWitness {
+        session_key_root: base.session_key_root,
+        flat_proof,
+        unique_keys: base.unique_keys,
+        orders: base.orders,
+    }
+}
+
 /// Build a Merkle-checked batch using one already-registered session key.
 /// All `count` orders share the same JMT proof — same key, same tree
 /// snapshot, same root. Per-order JMT work in the guest is identical
@@ -931,6 +978,79 @@ async fn run_and_report(label: &str, input: ProgramInput, elf: &[u8]) -> Result<
             println!(
                 "    {name:<30} {cycles:>12} {gas_est_str:>14} {pct:>6.1}%"
             );
+        }
+    }
+
+    Ok(())
+}
+
+/// Flat-witness analogue of `run_and_report_rkyv`: borsh `BatchSepticDedupFlat`
+/// tag in the first stdin chunk, rkyv-encoded `BatchSepticDedupFlatWitness`
+/// in the second. The guest accesses the archived witness zero-copy.
+async fn run_and_report_flat_rkyv(
+    label: &str,
+    witness: &shared::BatchSepticDedupFlatWitness,
+    elf: &[u8],
+) -> Result<()> {
+    let client = ProverClient::builder().cpu().build().await;
+
+    let tag_bytes = borsh::to_vec(&shared::ProgramInput::BatchSepticDedupFlat)
+        .expect("borsh serialize flat tag");
+    let rkyv_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(witness)
+        .expect("rkyv serialize flat witness");
+    let rkyv_len = rkyv_bytes.len();
+    let total_input = tag_bytes.len() + rkyv_len;
+
+    let mut stdin = SP1Stdin::new();
+    stdin.write_vec(tag_bytes);
+    stdin.write_slice(rkyv_bytes.as_ref());
+
+    println!("\n============================================================");
+    println!("  Profiling: {label}");
+    println!("============================================================");
+    println!(
+        "  input_size:         {total_input} bytes (1 B borsh tag + {rkyv_len} B rkyv flat witness)"
+    );
+
+    let (public_values, report) = client
+        .execute(Elf::from(elf), stdin)
+        .await
+        .map_err(|e| anyhow::anyhow!("execution failed: {e}"))?;
+
+    let output: ProofOutput =
+        borsh::from_slice(public_values.as_slice()).expect("borsh deserialize public output");
+
+    let total = report.total_instruction_count() + report.total_syscall_count();
+    let gas_opt = report.gas();
+    println!("  proof_type:         {}", output.proof_type);
+    println!("  total_instructions: {}", report.total_instruction_count());
+    println!("  total_syscalls:     {}", report.total_syscall_count());
+    println!("  total_cycles:       {total}");
+    if let Some(gas) = gas_opt {
+        let gas_per_cycle = gas as f64 / total as f64;
+        println!("  gas (normalized):   {gas}  ({gas_per_cycle:.3} gas/cycle)");
+    }
+    println!("  touched_memory:     {}", report.touched_memory_addresses);
+
+    if !report.cycle_tracker.is_empty() {
+        println!("\n  Cycle tracker breakdown:");
+        let header_gas = if gas_opt.is_some() { "gas (est.)" } else { "" };
+        println!(
+            "    {:<30} {:>12} {:>14} {:>7}",
+            "section", "cycles", header_gas, "%"
+        );
+        let mut entries: Vec<_> = report.cycle_tracker.iter().collect();
+        entries.sort_by_key(|(_, v)| std::cmp::Reverse(**v));
+        for (name, cycles) in entries {
+            let pct = (*cycles as f64 / total as f64) * 100.0;
+            let gas_est_str = match gas_opt {
+                Some(total_gas) => {
+                    let est = (*cycles as u128 * total_gas as u128 / total as u128) as u64;
+                    format!("{est}")
+                }
+                None => String::new(),
+            };
+            println!("    {name:<30} {cycles:>12} {gas_est_str:>14} {pct:>6.1}%");
         }
     }
 
@@ -1184,6 +1304,69 @@ async fn main() -> Result<()> {
             println!("\nGenerating 6000 septic Schnorr + Merkle witnesses (host-side)...");
             let input = build_batch_septic_verify_merkle_input(&fix, &app, 6000);
             run_and_report("BatchSepticVerifyMerkle (6000 Shamir + Merkle)", input, ELF).await?;
+        }
+        Some(s) if s.starts_with("batch-dedup-flat-") => {
+            // Shortcut form: `batch-dedup-flat-<unique>-<orders>`. Tree size
+            // tracks order count so JMT depth is apples-to-apples with the
+            // rkyv/batch modes below. Witness is a `FlatBatchExistenceProof`
+            // (pre-hashed siblings) serialized with rkyv.
+            let (unique_count, count) = parse_unique_orders_suffix(s, "batch-dedup-flat-");
+            let tree_size = count;
+            println!(
+                "\nGenerating flat witness: {} orders, {} unique, {} in JMT...",
+                count, unique_count, tree_size,
+            );
+            let witness = build_batch_septic_dedup_flat_witness(count, unique_count, tree_size);
+            run_and_report_flat_rkyv(
+                &format!(
+                    "BatchSepticDedupFlat ({} orders, {} unique in batch, {} in JMT)",
+                    count, unique_count, tree_size,
+                ),
+                &witness,
+                ELF,
+            )
+            .await?;
+        }
+        Some(s) if s.starts_with("batch-dedup-rkyv-") => {
+            // Shortcut form: `batch-dedup-rkyv-<unique>-<orders>`. Alias of
+            // `batch-septic-dedup-rkyv-<orders>` with unique-count baked in.
+            let (unique_count, count) = parse_unique_orders_suffix(s, "batch-dedup-rkyv-");
+            let tree_size = count;
+            println!(
+                "\nGenerating rkyv witness: {} orders, {} unique, {} in JMT...",
+                count, unique_count, tree_size,
+            );
+            let witness =
+                build_batch_septic_dedup_batch_witness(count, unique_count, tree_size);
+            run_and_report_rkyv(
+                &format!(
+                    "BatchSepticDedupRkyv ({} orders, {} unique in batch, {} in JMT)",
+                    count, unique_count, tree_size,
+                ),
+                &witness,
+                ELF,
+            )
+            .await?;
+        }
+        Some(s) if s.starts_with("batch-dedup-batch-") => {
+            // Shortcut form: `batch-dedup-batch-<unique>-<orders>`. Alias of
+            // `batch-septic-dedup-batch-<orders>` — borsh-wire BatchExistence.
+            let (unique_count, count) = parse_unique_orders_suffix(s, "batch-dedup-batch-");
+            let tree_size = count;
+            println!(
+                "\nGenerating BatchExistence+borsh witness: {} orders, {} unique, {} in JMT...",
+                count, unique_count, tree_size,
+            );
+            let input = build_batch_septic_dedup_batch_input(count, unique_count, tree_size);
+            run_and_report(
+                &format!(
+                    "BatchSepticDedupBatch ({} orders, {} unique in batch, {} in JMT)",
+                    count, unique_count, tree_size,
+                ),
+                input,
+                ELF,
+            )
+            .await?;
         }
         Some(s) if s.starts_with("batch-septic-dedup-rkyv-") => {
             // Same args as `batch-septic-dedup-batch-<count>` but the witness

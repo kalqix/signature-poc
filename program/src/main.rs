@@ -12,11 +12,12 @@ use jmt::{KeyHash, RootHash};
 
 use shared::{
     encode_session_key_leaf, session_key_hash,
-    ArchivedBatchSepticDedupBatchWitness, BatchEthWitness, BatchSepticDedupBatchWitness,
-    BatchSepticDedupWitness, BatchSepticOptWitness, BatchSepticSingleWitness,
-    BatchSepticVerifyMerkleWitness, BatchSepticVerifyWitness, BatchSepticWitness, EthOrderWitness,
-    OrderWitness, ProgramInput, ProofOutput, RegisterKeyWitness, SessionKeyLeaf,
-    VerifyOrderSepticWitness, eth_order_message, register_key_message, septic_order_message,
+    ArchivedBatchSepticDedupBatchWitness, ArchivedBatchSepticDedupFlatWitness, BatchEthWitness,
+    BatchSepticDedupBatchWitness, BatchSepticDedupWitness, BatchSepticOptWitness,
+    BatchSepticSingleWitness, BatchSepticVerifyMerkleWitness, BatchSepticVerifyWitness,
+    BatchSepticWitness, EthOrderWitness, OrderWitness, ProgramInput, ProofOutput,
+    RegisterKeyWitness, SessionKeyLeaf, VerifyOrderSepticWitness, eth_order_message,
+    register_key_message, septic_order_message,
     septic::{GENERATOR_X, GENERATOR_Y, GROUP_ORDER, scalar_add},
 };
 
@@ -998,6 +999,105 @@ fn handle_batch_septic_dedup_rkyv() {
     });
 }
 
+// ── Batch Septic Dedup (FlatBatchExistenceProof, rkyv zero-copy) ───────────
+
+/// Same verification semantics as `handle_batch_septic_dedup_rkyv`, but the
+/// Merkle proof is a `FlatBatchExistenceProof` — siblings are pre-hashed on
+/// the host, so each tree level costs one Poseidon2 call instead of two. The
+/// witness still travels as rkyv and the guest reads it zero-copy.
+fn handle_batch_septic_dedup_flat() {
+    // 1. Read the rkyv witness bytes (second stdin chunk).
+    println!("cycle-tracker-report-start: flat_read");
+    let bytes = sp1_zkvm::io::read_vec();
+    println!("cycle-tracker-report-end: flat_read");
+
+    // 2. Zero-copy access; pointer cast into the archived witness. The guest
+    //    trusts the host's byte layout — any tampering is caught by the
+    //    Merkle verify below.
+    println!("cycle-tracker-report-start: flat_access");
+    let archived: &ArchivedBatchSepticDedupFlatWitness =
+        unsafe { rkyv::access_unchecked::<ArchivedBatchSepticDedupFlatWitness>(&bytes) };
+    println!("cycle-tracker-report-end: flat_access");
+
+    let unique_count = archived.unique_keys.len();
+    let order_count = archived.orders.len();
+    let session_key_root_bytes: [u8; 32] = archived.session_key_root;
+
+    // 3. Single flat batch JMT verify (pre-hashed siblings, cached subtrees).
+    println!("cycle-tracker-report-start: flat_merkle_total");
+    assert!(
+        archived
+            .flat_proof
+            .verify::<shared::Poseidon2Hasher>(&session_key_root_bytes),
+        "FlatBatchExistenceProof verification failed"
+    );
+    println!("cycle-tracker-report-end: flat_merkle_total");
+
+    // 4. Bind each authenticated leaf to the claimed `unique_keys[i]`. Matches
+    //    the rkyv batch path so a malicious host can't pair one key's proof
+    //    with another key's pubkey.
+    assert_eq!(
+        archived.flat_proof.entries.len(),
+        unique_count,
+        "flat proof entry count must equal unique_keys length"
+    );
+    println!("cycle-tracker-report-start: flat_bind_leaves");
+    for (i, entry) in archived.flat_proof.entries.iter().enumerate() {
+        let leaf: SessionKeyLeaf =
+            bincode::deserialize(entry.value.as_slice()).expect("invalid session key leaf");
+        let key_info = &archived.unique_keys[i];
+        let info_address: [u8; 20] = key_info.account_address;
+        let info_pubkey_x: [u32; 7] = archived_array7_to_native(&key_info.pubkey_x);
+        let info_pubkey_y: [u32; 7] = archived_array7_to_native(&key_info.pubkey_y);
+        assert!(
+            leaf.account_address == info_address
+                && leaf.key_index == key_info.key_index
+                && leaf.pubkey_x == info_pubkey_x
+                && leaf.pubkey_y == info_pubkey_y,
+            "leaf/unique_keys mismatch at entry {}",
+            i
+        );
+        let expected_key_hash = session_key_hash(&info_address, key_info.key_index);
+        let proven_key_hash: [u8; 32] = entry.key_hash.0;
+        assert!(
+            proven_key_hash == expected_key_hash,
+            "entry key_hash does not match derived session_key_hash at entry {}",
+            i
+        );
+    }
+    println!("cycle-tracker-report-end: flat_bind_leaves");
+
+    // 5. Per-order Schnorr verify; pubkey from the now-bound unique_keys.
+    println!("cycle-tracker-report-start: flat_schnorr_total");
+    for order in archived.orders.iter() {
+        let key = &archived.unique_keys[order.key_idx.to_native() as usize];
+        let r_point = sp1_lib::septic::SepticPoint::new(
+            archived_array7_to_native(&order.signature_r_x),
+            archived_array7_to_native(&order.signature_r_y),
+        );
+        let pubkey = sp1_lib::septic::SepticPoint::new(
+            archived_array7_to_native(&key.pubkey_x),
+            archived_array7_to_native(&key.pubkey_y),
+        );
+        let s_limbs = archived_array8_to_native(&order.signature_s);
+        let e_limbs = archived_array8_to_native(&order.challenge_e);
+        let result = sp1_lib::septic::schnorr_compute(&pubkey, &s_limbs, &e_limbs);
+        assert!(
+            result.x() == r_point.x() && result.y() == r_point.y(),
+            "Schnorr verify failed in flat dedup batch"
+        );
+    }
+    println!("cycle-tracker-report-end: flat_schnorr_total");
+
+    commit_borsh(&ProofOutput {
+        old_session_key_root: session_key_root_bytes,
+        new_session_key_root: session_key_root_bytes,
+        account_address: [0u8; 20],
+        key_index: 0,
+        proof_type: format!("BATCH_DEDUP_FLAT_{}u_{}o", unique_count, order_count),
+    });
+}
+
 /// Archived `[u32; 7]` stores each element as `rend::u32_le` (transparent
 /// wrapper on LE targets); convert back to the native `[u32; 7]` shape
 /// expected by the septic precompile.
@@ -1075,6 +1175,7 @@ fn main() {
         ProgramInput::BatchSepticDedup(w) => handle_batch_septic_dedup(w),
         ProgramInput::BatchSepticDedupBatch(w) => handle_batch_septic_dedup_batch(w),
         ProgramInput::BatchSepticDedupRkyv => handle_batch_septic_dedup_rkyv(),
+        ProgramInput::BatchSepticDedupFlat => handle_batch_septic_dedup_flat(),
         ProgramInput::BatchEth(w) => handle_batch_eth(w),
     }
 }

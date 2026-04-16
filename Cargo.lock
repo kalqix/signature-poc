@@ -2034,7 +2034,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "jmt"
 version = "0.12.0"
-source = "git+https://github.com/kalqix/jmt?rev=435ff9f9ab4f4ba29ef6b9c13172a4087d612eac#435ff9f9ab4f4ba29ef6b9c13172a4087d612eac"
+source = "git+https://github.com/kalqix/jmt?rev=4bd0faa76480419b0eda86e13b0d61e27d495f40#4bd0faa76480419b0eda86e13b0d61e27d495f40"
 dependencies = [
  "anyhow",
  "borsh",
@@ -5093,7 +5093,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
