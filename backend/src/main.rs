@@ -69,18 +69,27 @@ async fn register_key(
         key_index: req.key_index,
     };
 
-    let (old_leaf_hash, old_root, new_root, siblings, leaf_index) = {
+    let result = {
         let mut app = state.app.lock().await;
         app.register_key(req.account_address, key)
     };
 
+    let result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("register failed: {e}")})),
+            );
+        }
+    };
+
     let witness = RegisterKeyWitness {
         request: req,
-        old_leaf_hash,
-        old_session_key_root: old_root,
-        new_session_key_root: new_root,
-        merkle_siblings: siblings,
-        leaf_index,
+        old_session_key_root: result.old_root,
+        new_session_key_root: result.new_root,
+        old_proof: result.old_proof,
+        old_leaf: result.old_leaf,
     };
 
     let input = ProgramInput::RegisterKey(witness);
@@ -131,10 +140,10 @@ async fn place_order(
     State(state): State<ServerState>,
     Json(order): Json<SignedOrder>,
 ) -> impl IntoResponse {
-    let (session_key, siblings, leaf_index, root) = {
+    let proof = {
         let app = state.app.lock().await;
         match app.get_key_proof(order.account_address, order.key_index) {
-            Some((key, sibs, idx)) => (key, sibs, idx, app.current_root),
+            Some(p) => p,
             None => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -146,10 +155,9 @@ async fn place_order(
 
     let witness = OrderWitness {
         order: order.clone(),
-        session_key,
-        session_key_root: root,
-        merkle_siblings: siblings,
-        leaf_index,
+        session_key: proof.key,
+        session_key_root: proof.root,
+        merkle_proof: proof.proof,
     };
 
     let input = ProgramInput::VerifyOrder(witness);
@@ -251,12 +259,12 @@ async fn place_order_septic(
     let account_address = witness.order.account_address;
     let key_index = witness.order.key_index;
 
-    // Look up the session key's Merkle proof. If the client-supplied pubkey
-    // doesn't match what's at this leaf, the guest's Merkle check will fail.
-    let (siblings, leaf_index, root) = {
+    // Look up the session key's JMT proof. If the client-supplied pubkey
+    // doesn't match what's at this leaf, the guest's inclusion check fails.
+    let proof = {
         let app = state.app.lock().await;
         match app.get_key_proof(account_address, key_index) {
-            Some((_key, sibs, idx)) => (sibs, idx, app.current_root),
+            Some(p) => p,
             None => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -268,12 +276,11 @@ async fn place_order_septic(
 
     let entry = SepticMerkleOrder {
         bench: witness,
-        merkle_siblings: siblings,
-        leaf_index,
+        merkle_proof: proof.proof,
     };
     let input = ProgramInput::BatchSepticVerifyMerkle(BatchSepticVerifyMerkleWitness {
         orders: vec![entry],
-        session_key_root: root,
+        session_key_root: proof.root,
     });
 
     match run_proof(input, ELF, &state.prover).await {

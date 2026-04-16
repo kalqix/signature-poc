@@ -34,10 +34,14 @@ One SP1 6.0.2 guest program handles three transaction types:
 
 2. Poseidon2 for everything in the session key tree
    Both leaf hashing and node hashing use Poseidon2.
-   Backend uses p3-poseidon2 (BabyBear, width 16, rate 8).
-   Circuit uses sp1_zkvm::poseidon2::Poseidon2ByteHash.
-   Both must produce byte-identical output — verified by alignment test
-   in backend/src/state.rs::test_poseidon2_host_guest_alignment().
+   The session key tree is a Jellyfish Merkle Tree (jmt crate, kalqix
+   fork) — variable depth ~log2(N), supports insert/rotate/delete.
+   `shared::Poseidon2Hasher` implements `jmt::SimpleHasher` and dispatches
+   on cfg(target_os = "zkvm"):
+     guest: sp1_zkvm::syscalls::Poseidon2ByteHash precompile
+     host:  sp1_primitives::poseidon2_init + length-prefixed sponge
+   Both paths must produce byte-identical output — verified by
+   `shared/src/poseidon2_hasher.rs::test_poseidon2_host_vs_guest_sponge`.
 
 3. Web Crypto non-extractable keys
    Ed25519 private keys are stored in IndexedDB as CryptoKey objects
@@ -86,8 +90,8 @@ Use the dedicated profile binary for cycle counting:
 The guest program has cycle-tracker-report annotations. Access
 per-section cycle counts via report.cycle_tracker["label"]:
 
-  RegisterKey:    merkle_verify_old, eip191_recover, hash_new_leaf, merkle_verify_new
-  VerifyOrder:    merkle_verify, sha256_hash, ed25519_verify
+  RegisterKey:    jmt_verify_old, eip191_recover
+  VerifyOrder:    jmt_verify, schnorr_verify
   VerifyOrderEth: eip191_hash, secp256k1_recover
 
 The comparison between VerifyOrder and VerifyOrderEth cycle counts
@@ -103,9 +107,16 @@ Set TRACE_FILE and TRACE_SAMPLE_RATE env vars to generate trace files.
   -------------------------------------------------------
   program/src/main.rs              → program/range/src/main.rs
   shared/src/lib.rs (session types)→ shared/src/models/session_key.rs
-  backend/src/state.rs (tree)      → host/src/state/session_key_store.rs
+  shared/src/poseidon2_hasher.rs   → shared/src/jmt_hasher.rs
+  backend/src/state.rs (JMT)       → host/src/state/session_key_store.rs
   backend/src/witness.rs           → host/src/proposer.rs
   BlocksInfoStruct (2 new fields)  → shared/src/types.rs
+
+The POC uses `jmt::mock::MockTreeStore`; production should swap in the
+RocksDB-backed `TreeReader`/`TreeWriter`. Witness types
+(`SparseMerkleProof<Poseidon2Hasher>`) and the guest verify path
+(`proof.verify_existence` / `verify_nonexistence`) are unchanged
+between mock and production storage.
 
 ## What does NOT map to kalqix-zk-service
 
@@ -116,12 +127,20 @@ Set TRACE_FILE and TRACE_SAMPLE_RATE env vars to generate trace files.
 
 ## Critical tests (run before any code change)
 
-  cargo test test_poseidon2_host_guest_alignment  # in backend/
-  cargo test test_poseidon2_parameters             # in backend/
-  cargo prove build                                # in program/
+  cargo test test_poseidon2_host_vs_guest_sponge   # in shared/
+  cargo test test_poseidon2_parameters             # in shared/
+  cargo test --package backend                     # state.rs JMT round-trips
+  cargo prove build --elf-name signature-poc \     # in program/
+                   --output-directory elf
 
-If test_poseidon2_host_guest_alignment fails, all Merkle proofs will
-fail silently. Fix it before anything else.
+If test_poseidon2_host_vs_guest_sponge fails, all JMT proofs will fail
+silently in the guest (UnexpectedEof or root mismatch). Fix it before
+anything else.
+
+The `--elf-name`/`--output-directory` flags on `cargo prove build` are
+load-bearing: the backend `include_bytes!`s `program/elf/signature-poc`,
+not the default target dir. Plain `cargo prove build` will silently
+leave a stale ELF at `program/elf/`.
 
 ## Known limitations (intentional, not bugs)
 

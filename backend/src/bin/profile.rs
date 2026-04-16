@@ -36,6 +36,30 @@ use state::AppState;
 
 const ELF: &[u8] = include_bytes!("../../../program/elf/signature-poc");
 
+/// Parse `<prefix><unique>-<orders>` (e.g. `batch-dedup-flat-200-6000`)
+/// into `(unique_count, order_count)`. Panics with a helpful message on
+/// malformed inputs — this is a CLI-only parser and bad args are user error.
+fn parse_unique_orders_suffix(mode: &str, prefix: &str) -> (usize, usize) {
+    let rest = mode
+        .strip_prefix(prefix)
+        .unwrap_or_else(|| panic!("mode {mode:?} does not start with {prefix:?}"));
+    let (unique_str, orders_str) = rest
+        .split_once('-')
+        .unwrap_or_else(|| panic!("expected `<unique>-<orders>` after prefix in {mode:?}"));
+    let unique: usize = unique_str
+        .parse()
+        .unwrap_or_else(|_| panic!("unique count {unique_str:?} is not a positive integer"));
+    let orders: usize = orders_str
+        .parse()
+        .unwrap_or_else(|_| panic!("order count {orders_str:?} is not a positive integer"));
+    assert!(unique >= 1, "unique count must be >= 1");
+    assert!(
+        unique <= orders,
+        "unique count ({unique}) must be <= order count ({orders})"
+    );
+    (unique, orders)
+}
+
 fn keccak256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Keccak::v256();
     hasher.update(data);
@@ -177,8 +201,9 @@ fn build_register_key_input(fix: &TestFixtures, app: &mut AppState) -> ProgramIn
         key_index: 0,
     };
 
-    let (old_leaf_hash, old_root, new_root, siblings, leaf_index) =
-        app.register_key(fix.address, key);
+    let result = app
+        .register_key(fix.address, key)
+        .expect("register_key failed");
 
     let message = register_key_message(&fix.address, &pubkey_x, &pubkey_y, 0);
     let digest = eip191_hash(&message);
@@ -192,19 +217,17 @@ fn build_register_key_input(fix: &TestFixtures, app: &mut AppState) -> ProgramIn
             pubkey_y,
             eth_signature_hex: eth_sig_hex,
         },
-        old_leaf_hash,
-        old_session_key_root: old_root,
-        new_session_key_root: new_root,
-        merkle_siblings: siblings,
-        leaf_index,
+        old_session_key_root: result.old_root,
+        new_session_key_root: result.new_root,
+        old_proof: result.old_proof,
+        old_leaf: result.old_leaf,
     })
 }
 
 fn build_verify_order_input(fix: &TestFixtures, app: &AppState) -> ProgramInput {
-    let (session_key, siblings, leaf_index) = app
+    let proof = app
         .get_key_proof(fix.address, 0)
         .expect("key not registered");
-    let root = app.current_root;
 
     let order_msg_str = format!(
         "ETH/USDC:BUY:2000000:100:{}",
@@ -228,10 +251,9 @@ fn build_verify_order_input(fix: &TestFixtures, app: &AppState) -> ProgramInput 
 
     ProgramInput::VerifyOrder(OrderWitness {
         order,
-        session_key,
-        session_key_root: root,
-        merkle_siblings: siblings,
-        leaf_index,
+        session_key: proof.key,
+        session_key_root: proof.root,
+        merkle_proof: proof.proof,
     })
 }
 
@@ -257,13 +279,12 @@ fn build_verify_order_eth_input(fix: &TestFixtures) -> ProgramInput {
 }
 
 fn build_verify_order_septic_input(fix: &TestFixtures, app: &AppState) -> ProgramInput {
-    // Reuse the registered key's Merkle proof so this path is apples-to-apples
+    // Reuse the registered key's JMT proof so this path is apples-to-apples
     // with `build_verify_order_input` (same tree, same session key, same
-    // siblings) — only the scalar-mul strategy in the guest differs.
-    let (_session_key, siblings, leaf_index) = app
+    // proof) — only the scalar-mul strategy in the guest differs.
+    let proof = app
         .get_key_proof(fix.address, 0)
         .expect("key not registered — call build_register_key_input first");
-    let root = app.current_root;
 
     let order_msg = format!("ETH/USDC:BUY:2000000:100:{}", hex::encode(fix.address));
     let msg_hash: [u8; 32] = Sha256::digest(order_msg.as_bytes()).into();
@@ -293,9 +314,8 @@ fn build_verify_order_septic_input(fix: &TestFixtures, app: &AppState) -> Progra
 
     ProgramInput::VerifyOrderSeptic(VerifyOrderSepticWitness {
         bench,
-        session_key_root: root,
-        merkle_siblings: siblings,
-        leaf_index,
+        session_key_root: proof.root,
+        merkle_proof: proof.proof,
     })
 }
 
@@ -402,89 +422,52 @@ fn build_batch_septic_verify_input(fix: &TestFixtures, count: usize) -> ProgramI
     }
 }
 
-// ── Large-depth in-memory Merkle tree for the dedup benchmark ──────────────
-
-/// A Merkle tree built once over `1 << depth` leaves, with all internal nodes
-/// cached so per-leaf sibling lookups are O(depth). Uses the same Poseidon2
-/// byte hash as the production state tree so proofs are guest-verifiable.
-struct BenchTree {
-    depth: usize,
-    levels: Vec<Vec<[u8; 32]>>, // levels[0] = leaves, levels[depth] = [root]
-}
-
-fn bench_hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut combined = [0u8; 64];
-    combined[..32].copy_from_slice(left);
-    combined[32..].copy_from_slice(right);
-    state::poseidon2_hash_bytes(&combined)
-}
-
-impl BenchTree {
-    fn new(depth: usize, leaves: Vec<[u8; 32]>) -> Self {
-        assert_eq!(leaves.len(), 1usize << depth, "leaves must be 2^depth");
-        let mut levels = Vec::with_capacity(depth + 1);
-        levels.push(leaves);
-        for level in 0..depth {
-            let prev = &levels[level];
-            let mut next = Vec::with_capacity(prev.len() / 2);
-            for pair in prev.chunks_exact(2) {
-                next.push(bench_hash_pair(&pair[0], &pair[1]));
-            }
-            levels.push(next);
-        }
-        Self { depth, levels }
-    }
-
-    fn root(&self) -> [u8; 32] {
-        self.levels[self.depth][0]
-    }
-
-    fn siblings(&self, leaf_index: u64) -> Vec<[u8; 32]> {
-        let mut siblings = Vec::with_capacity(self.depth);
-        let mut idx = leaf_index as usize;
-        for level in 0..self.depth {
-            siblings.push(self.levels[level][idx ^ 1]);
-            idx /= 2;
-        }
-        siblings
-    }
-}
-
-/// Build a deduped batch: `count` total orders signed by ~`(1 - repetition_ratio) × count`
-/// unique session keys. Each unique key is registered into a fresh in-memory
-/// tree (depth chosen to fit), and orders are randomly distributed across keys
-/// — first `unique_count` orders introduce a fresh key, remaining orders
-/// re-use a previously-introduced key (then the order list is shuffled).
-fn build_batch_septic_dedup_input(count: usize, repetition_ratio: f64) -> ProgramInput {
+/// Build a deduped batch:
+///   - `tree_size`   total keys inserted into a fresh JMT (drives proof depth).
+///   - `unique_count` keys (the first slice) are referenced by the batch and
+///                   carry inclusion proofs in the witness.
+///   - `count`       total orders, randomly distributed across the
+///                   `unique_count` referenced keys (first `unique_count`
+///                   orders introduce a fresh key, then random reuse, then
+///                   shuffle).
+///
+/// `tree_size == unique_count` is the original behavior (proof depth tracks
+/// the batch's unique-key count). `tree_size > unique_count` lets the
+/// benchmark hold the JMT depth fixed (e.g., 6000-key tree) while varying
+/// how much per-batch dedup the workload exposes (e.g., 200 unique keys).
+fn build_batch_septic_dedup_input(
+    count: usize,
+    unique_count: usize,
+    tree_size: usize,
+) -> ProgramInput {
+    use jmt::mock::MockTreeStore;
+    use jmt::{JellyfishMerkleTree, KeyHash};
     use rand::seq::SliceRandom;
     use rand::Rng;
+    use shared::{encode_session_key_leaf, session_key_hash, Poseidon2Hasher};
 
-    assert!((0.0..=1.0).contains(&repetition_ratio), "ratio must be in [0, 1]");
-    let unique_count = (((count as f64) * (1.0 - repetition_ratio)).ceil() as usize).max(1);
-
-    // Tree depth large enough to hold all unique keys (next power of two).
-    let mut depth = 1usize;
-    while (1usize << depth) < unique_count {
-        depth += 1;
-    }
-    let num_leaves = 1usize << depth;
-
-    println!(
-        "  Dedup config: {} orders, {} unique keys ({:.0}% repetition), tree depth {} ({} leaves)",
-        count,
+    assert!(unique_count >= 1, "unique_count must be >= 1");
+    assert!(
+        unique_count <= tree_size,
+        "unique_count ({}) must be <= tree_size ({})",
         unique_count,
-        repetition_ratio * 100.0,
-        depth,
-        num_leaves
+        tree_size
     );
 
-    // 1. Generate `unique_count` session pairs + synthetic addresses.
-    let mut session_pairs: Vec<(SessionPair, [u8; 20], u8, u64)> = Vec::with_capacity(unique_count);
-    let mut leaf_hashes = vec![[0u8; 32]; num_leaves];
+    println!(
+        "  Dedup config: {} orders, {} unique keys in batch, {} keys in JMT (depth ~{})",
+        count,
+        unique_count,
+        tree_size,
+        ((tree_size as f64).log2().ceil() as usize).max(0),
+    );
 
-    for i in 0..unique_count {
+    // 1. Generate `tree_size` session pairs + synthetic addresses + JMT leaves.
+    let mut session_pairs: Vec<(SessionPair, [u8; 20], u8)> = Vec::with_capacity(tree_size);
+    let mut value_set: Vec<(KeyHash, Option<Vec<u8>>)> = Vec::with_capacity(tree_size);
+
+    for i in 0..tree_size {
         let session = make_session_pair();
-        // Synthetic per-key address — register-key is not used in this benchmark.
         let mut address = [0u8; 20];
         address[..8].copy_from_slice(&(i as u64).to_le_bytes());
         let key_index = 0u8;
@@ -495,34 +478,56 @@ fn build_batch_septic_dedup_input(count: usize, repetition_ratio: f64) -> Progra
             pubkey_x: session.pubkey.x.0,
             pubkey_y: session.pubkey.y.0,
         };
-        let leaf_hash = state::poseidon2_hash_bytes(&bincode::serialize(&leaf).unwrap());
-        leaf_hashes[i] = leaf_hash;
+        let leaf_value = encode_session_key_leaf(&leaf);
+        let key_hash = KeyHash(session_key_hash(&address, key_index));
+        value_set.push((key_hash, Some(leaf_value)));
 
-        session_pairs.push((session, address, key_index, i as u64));
+        session_pairs.push((session, address, key_index));
 
-        if unique_count >= 500 && (i + 1) % 500 == 0 {
-            println!("  generated {}/{} unique keys", i + 1, unique_count);
+        if tree_size >= 500 && (i + 1) % 500 == 0 {
+            println!("  generated {}/{} keys for JMT", i + 1, tree_size);
         }
     }
 
-    // 2. Build the bench tree once, then pull siblings per unique key.
-    let tree = BenchTree::new(depth, leaf_hashes);
-    let root = tree.root();
+    // 2. Batch-insert all `tree_size` keys into a fresh JMT at version 1.
+    let store = MockTreeStore::default();
+    let (root, batch) = {
+        let tree: JellyfishMerkleTree<MockTreeStore, Poseidon2Hasher> =
+            JellyfishMerkleTree::new(&store);
+        tree.put_value_set(value_set, 1).expect("dedup put_value_set")
+    };
+    store
+        .write_tree_update_batch(batch)
+        .expect("dedup write_tree_update_batch");
 
-    let unique_keys: Vec<DedupKey> = session_pairs
-        .iter()
-        .map(|(session, address, key_index, leaf_index)| DedupKey {
-            account_address: *address,
-            key_index: *key_index,
-            pubkey_x: session.pubkey.x.0,
-            pubkey_y: session.pubkey.y.0,
-            merkle_siblings: tree.siblings(*leaf_index),
-            leaf_index: *leaf_index,
-        })
-        .collect();
+    // 3. Pull JMT inclusion proofs for the FIRST `unique_count` keys — these
+    //    are the only ones the batch references. Remaining (tree_size -
+    //    unique_count) tree entries just contribute to depth.
+    let unique_keys: Vec<DedupKey> = {
+        let tree: JellyfishMerkleTree<MockTreeStore, Poseidon2Hasher> =
+            JellyfishMerkleTree::new(&store);
+        session_pairs
+            .iter()
+            .take(unique_count)
+            .map(|(session, address, key_index)| {
+                let key_hash = KeyHash(session_key_hash(address, *key_index));
+                let (_value, proof) = tree
+                    .get_with_proof(key_hash, 1)
+                    .expect("dedup get_with_proof");
+                DedupKey {
+                    account_address: *address,
+                    key_index: *key_index,
+                    pubkey_x: session.pubkey.x.0,
+                    pubkey_y: session.pubkey.y.0,
+                    merkle_proof: proof,
+                }
+            })
+            .collect()
+    };
 
-    // 3. Generate `count` orders. First `unique_count` use distinct keys;
-    //    remainder pick a previously-used key at random.
+    // 4. Generate `count` orders against the first `unique_count` keys. First
+    //    `unique_count` orders introduce a fresh key; remainder pick a
+    //    previously-used unique-key index at random.
     let mut rng = rand::rngs::OsRng;
     let mut orders = Vec::with_capacity(count);
     for i in 0..count {
@@ -531,7 +536,7 @@ fn build_batch_septic_dedup_input(count: usize, repetition_ratio: f64) -> Progra
         } else {
             rng.gen_range(0..unique_count)
         };
-        let (session, address, _key_index, _leaf_index) = &session_pairs[key_idx];
+        let (session, address, _key_index) = &session_pairs[key_idx];
         let order_msg = format!(
             "ETH/USDC:BUY:{}:{}:{}",
             2000000 + i,
@@ -564,23 +569,210 @@ fn build_batch_septic_dedup_input(count: usize, repetition_ratio: f64) -> Progra
     ProgramInput::BatchSepticDedup(BatchSepticDedupWitness {
         unique_keys,
         orders,
-        session_key_root: root,
+        session_key_root: root.0,
     })
 }
 
+/// Same shape as `build_batch_septic_dedup_input`, but emits a
+/// `BatchSepticDedupBatchWitness` that wraps all unique-key proofs in
+/// a single `BatchExistenceProof`. Tree construction and order
+/// distribution are identical, so cycle-count deltas against the
+/// non-batch builder isolate the `BatchExistenceProof::verify` win.
+///
+/// Returns the raw witness so it can be wrapped into either
+/// `ProgramInput::BatchSepticDedupBatch(..)` (borsh path) or handed
+/// directly to `run_and_report_rkyv` (zero-copy path).
+fn build_batch_septic_dedup_batch_witness(
+    count: usize,
+    unique_count: usize,
+    tree_size: usize,
+) -> shared::BatchSepticDedupBatchWitness {
+    use jmt::mock::MockTreeStore;
+    use jmt::{build_batch_existence_proof, JellyfishMerkleTree, KeyHash};
+    use rand::seq::SliceRandom;
+    use rand::Rng;
+    use shared::{
+        encode_session_key_leaf, session_key_hash, BatchSepticDedupBatchWitness, Poseidon2Hasher,
+        UniqueKeyInfo,
+    };
+
+    assert!(unique_count >= 1, "unique_count must be >= 1");
+    assert!(
+        unique_count <= tree_size,
+        "unique_count ({}) must be <= tree_size ({})",
+        unique_count,
+        tree_size
+    );
+
+    println!(
+        "  DedupBatch config: {} orders, {} unique in batch, {} keys in JMT (depth ~{})",
+        count,
+        unique_count,
+        tree_size,
+        ((tree_size as f64).log2().ceil() as usize).max(0),
+    );
+
+    // 1. Generate `tree_size` session pairs + addresses + JMT leaves.
+    let mut session_pairs: Vec<(SessionPair, [u8; 20], u8)> = Vec::with_capacity(tree_size);
+    let mut value_set: Vec<(KeyHash, Option<Vec<u8>>)> = Vec::with_capacity(tree_size);
+
+    for i in 0..tree_size {
+        let session = make_session_pair();
+        let mut address = [0u8; 20];
+        address[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        let key_index = 0u8;
+
+        let leaf = SessionKeyLeaf {
+            account_address: address,
+            key_index,
+            pubkey_x: session.pubkey.x.0,
+            pubkey_y: session.pubkey.y.0,
+        };
+        let leaf_value = encode_session_key_leaf(&leaf);
+        let key_hash = KeyHash(session_key_hash(&address, key_index));
+        value_set.push((key_hash, Some(leaf_value)));
+
+        session_pairs.push((session, address, key_index));
+
+        if tree_size >= 500 && (i + 1) % 500 == 0 {
+            println!("  generated {}/{} keys for JMT", i + 1, tree_size);
+        }
+    }
+
+    // 2. Insert all keys at version 1.
+    let store = MockTreeStore::default();
+    let (root, batch_update) = {
+        let tree: JellyfishMerkleTree<MockTreeStore, Poseidon2Hasher> =
+            JellyfishMerkleTree::new(&store);
+        tree.put_value_set(value_set, 1)
+            .expect("dedup-batch put_value_set")
+    };
+    store
+        .write_tree_update_batch(batch_update)
+        .expect("dedup-batch write_tree_update_batch");
+
+    // 3. Pull individual inclusion proofs for the first `unique_count` keys,
+    //    then fold them into a BatchExistenceProof.
+    let tree: JellyfishMerkleTree<MockTreeStore, Poseidon2Hasher> =
+        JellyfishMerkleTree::new(&store);
+    let mut proof_entries: Vec<(
+        KeyHash,
+        Vec<u8>,
+        jmt::proof::SparseMerkleProof<Poseidon2Hasher>,
+    )> = Vec::with_capacity(unique_count);
+    let mut key_infos: Vec<UniqueKeyInfo> = Vec::with_capacity(unique_count);
+
+    for (session, address, key_index) in session_pairs.iter().take(unique_count) {
+        let key_hash = KeyHash(session_key_hash(address, *key_index));
+        let (value_opt, proof) = tree
+            .get_with_proof(key_hash, 1)
+            .expect("dedup-batch get_with_proof");
+        let value = value_opt.expect("key was just inserted, should exist");
+        proof_entries.push((key_hash, value, proof));
+        key_infos.push(UniqueKeyInfo {
+            account_address: *address,
+            key_index: *key_index,
+            pubkey_x: session.pubkey.x.0,
+            pubkey_y: session.pubkey.y.0,
+        });
+    }
+
+    let batch_proof = build_batch_existence_proof(proof_entries);
+
+    // 4. Same order-distribution logic as the non-batch dedup builder.
+    let mut rng = rand::rngs::OsRng;
+    let mut orders = Vec::with_capacity(count);
+    for i in 0..count {
+        let key_idx: usize = if i < unique_count {
+            i
+        } else {
+            rng.gen_range(0..unique_count)
+        };
+        let (session, address, _key_index) = &session_pairs[key_idx];
+        let order_msg = format!(
+            "ETH/USDC:BUY:{}:{}:{}",
+            2000000 + i,
+            100 + (i % 50),
+            hex::encode(address)
+        );
+        let msg_hash: [u8; 32] = Sha256::digest(order_msg.as_bytes()).into();
+        let (r_x, r_y, s_limbs, e_limbs) = schnorr_sign(session, &msg_hash);
+
+        orders.push(DedupOrder {
+            key_idx: key_idx as u32,
+            market: "ETH/USDC".to_string(),
+            side: "BUY".to_string(),
+            price: 2000000 + i as u64,
+            quantity: 100 + (i % 50) as u64,
+            signature_r_x: r_x,
+            signature_r_y: r_y,
+            signature_s: s_limbs,
+            challenge_e: e_limbs,
+        });
+
+        if count >= 500 && (i + 1) % 500 == 0 {
+            println!("  generated {}/{} orders", i + 1, count);
+        }
+    }
+    orders.shuffle(&mut rng);
+
+    BatchSepticDedupBatchWitness {
+        session_key_root: root.0,
+        batch_proof,
+        unique_keys: key_infos,
+        orders,
+    }
+}
+
+/// Borsh-path wrapper: calls `build_batch_septic_dedup_batch_witness` and
+/// wraps the result in `ProgramInput::BatchSepticDedupBatch`.
+fn build_batch_septic_dedup_batch_input(
+    count: usize,
+    unique_count: usize,
+    tree_size: usize,
+) -> ProgramInput {
+    ProgramInput::BatchSepticDedupBatch(build_batch_septic_dedup_batch_witness(
+        count,
+        unique_count,
+        tree_size,
+    ))
+}
+
+/// Same tree/key/order distribution as `build_batch_septic_dedup_batch_witness`,
+/// but the JMT witness is a `FlatBatchExistenceProof` (siblings pre-hashed on
+/// the host). Cycle-count deltas against the BatchExistence+rkyv path isolate
+/// the flat-sibling win.
+fn build_batch_septic_dedup_flat_witness(
+    count: usize,
+    unique_count: usize,
+    tree_size: usize,
+) -> shared::BatchSepticDedupFlatWitness {
+    use jmt::flat_proof::FlatBatchExistenceProof;
+    use shared::Poseidon2Hasher;
+
+    let base = build_batch_septic_dedup_batch_witness(count, unique_count, tree_size);
+    let flat_proof = FlatBatchExistenceProof::from_batch::<Poseidon2Hasher>(&base.batch_proof);
+
+    shared::BatchSepticDedupFlatWitness {
+        session_key_root: base.session_key_root,
+        flat_proof,
+        unique_keys: base.unique_keys,
+        orders: base.orders,
+    }
+}
+
 /// Build a Merkle-checked batch using one already-registered session key.
-/// All `count` orders share the same Merkle proof — same key, same tree
-/// snapshot, same root. Per-order Merkle work in the guest is identical
-/// regardless of whether siblings are unique or duplicated.
+/// All `count` orders share the same JMT proof — same key, same tree
+/// snapshot, same root. Per-order JMT work in the guest is identical
+/// regardless of whether proofs are unique or duplicated.
 fn build_batch_septic_verify_merkle_input(
     fix: &TestFixtures,
     app: &AppState,
     count: usize,
 ) -> ProgramInput {
-    let (_key, siblings, leaf_index) = app
+    let proof = app
         .get_key_proof(fix.address, 0)
         .expect("key not registered — call build_register_key_input first");
-    let root = app.current_root;
 
     let mut orders = Vec::with_capacity(count);
     for i in 0..count {
@@ -614,8 +806,7 @@ fn build_batch_septic_verify_merkle_input(
         };
         orders.push(SepticMerkleOrder {
             bench,
-            merkle_siblings: siblings.clone(),
-            leaf_index,
+            merkle_proof: proof.proof.clone(),
         });
 
         if count >= 500 && (i + 1) % 500 == 0 {
@@ -625,7 +816,7 @@ fn build_batch_septic_verify_merkle_input(
 
     ProgramInput::BatchSepticVerifyMerkle(BatchSepticVerifyMerkleWitness {
         orders,
-        session_key_root: root,
+        session_key_root: proof.root,
     })
 }
 
@@ -735,19 +926,24 @@ fn bench_signing(fix: &TestFixtures, count: usize) {
 async fn run_and_report(label: &str, input: ProgramInput, elf: &[u8]) -> Result<()> {
     let client = ProverClient::builder().cpu().build().await;
 
+    // borsh wire format (faster than bincode in the zkVM).
+    let input_bytes = borsh::to_vec(&input).expect("borsh serialize input");
+    let input_size = input_bytes.len();
     let mut stdin = SP1Stdin::new();
-    stdin.write(&input);
+    stdin.write_vec(input_bytes);
 
     println!("\n============================================================");
     println!("  Profiling: {label}");
     println!("============================================================");
+    println!("  input_size:         {input_size} bytes (borsh)");
 
-    let (mut public_values, report) = client
+    let (public_values, report) = client
         .execute(Elf::from(elf), stdin)
         .await
         .map_err(|e| anyhow::anyhow!("execution failed: {e}"))?;
 
-    let output: ProofOutput = public_values.read();
+    let output: ProofOutput =
+        borsh::from_slice(public_values.as_slice()).expect("borsh deserialize public output");
 
     let total = report.total_instruction_count() + report.total_syscall_count();
     let gas_opt = report.gas();
@@ -782,6 +978,153 @@ async fn run_and_report(label: &str, input: ProgramInput, elf: &[u8]) -> Result<
             println!(
                 "    {name:<30} {cycles:>12} {gas_est_str:>14} {pct:>6.1}%"
             );
+        }
+    }
+
+    Ok(())
+}
+
+/// Flat-witness analogue of `run_and_report_rkyv`: borsh `BatchSepticDedupFlat`
+/// tag in the first stdin chunk, rkyv-encoded `BatchSepticDedupFlatWitness`
+/// in the second. The guest accesses the archived witness zero-copy.
+async fn run_and_report_flat_rkyv(
+    label: &str,
+    witness: &shared::BatchSepticDedupFlatWitness,
+    elf: &[u8],
+) -> Result<()> {
+    let client = ProverClient::builder().cpu().build().await;
+
+    let tag_bytes = borsh::to_vec(&shared::ProgramInput::BatchSepticDedupFlat)
+        .expect("borsh serialize flat tag");
+    let rkyv_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(witness)
+        .expect("rkyv serialize flat witness");
+    let rkyv_len = rkyv_bytes.len();
+    let total_input = tag_bytes.len() + rkyv_len;
+
+    let mut stdin = SP1Stdin::new();
+    stdin.write_vec(tag_bytes);
+    stdin.write_slice(rkyv_bytes.as_ref());
+
+    println!("\n============================================================");
+    println!("  Profiling: {label}");
+    println!("============================================================");
+    println!(
+        "  input_size:         {total_input} bytes (1 B borsh tag + {rkyv_len} B rkyv flat witness)"
+    );
+
+    let (public_values, report) = client
+        .execute(Elf::from(elf), stdin)
+        .await
+        .map_err(|e| anyhow::anyhow!("execution failed: {e}"))?;
+
+    let output: ProofOutput =
+        borsh::from_slice(public_values.as_slice()).expect("borsh deserialize public output");
+
+    let total = report.total_instruction_count() + report.total_syscall_count();
+    let gas_opt = report.gas();
+    println!("  proof_type:         {}", output.proof_type);
+    println!("  total_instructions: {}", report.total_instruction_count());
+    println!("  total_syscalls:     {}", report.total_syscall_count());
+    println!("  total_cycles:       {total}");
+    if let Some(gas) = gas_opt {
+        let gas_per_cycle = gas as f64 / total as f64;
+        println!("  gas (normalized):   {gas}  ({gas_per_cycle:.3} gas/cycle)");
+    }
+    println!("  touched_memory:     {}", report.touched_memory_addresses);
+
+    if !report.cycle_tracker.is_empty() {
+        println!("\n  Cycle tracker breakdown:");
+        let header_gas = if gas_opt.is_some() { "gas (est.)" } else { "" };
+        println!(
+            "    {:<30} {:>12} {:>14} {:>7}",
+            "section", "cycles", header_gas, "%"
+        );
+        let mut entries: Vec<_> = report.cycle_tracker.iter().collect();
+        entries.sort_by_key(|(_, v)| std::cmp::Reverse(**v));
+        for (name, cycles) in entries {
+            let pct = (*cycles as f64 / total as f64) * 100.0;
+            let gas_est_str = match gas_opt {
+                Some(total_gas) => {
+                    let est = (*cycles as u128 * total_gas as u128 / total as u128) as u64;
+                    format!("{est}")
+                }
+                None => String::new(),
+            };
+            println!("    {name:<30} {cycles:>12} {gas_est_str:>14} {pct:>6.1}%");
+        }
+    }
+
+    Ok(())
+}
+
+/// Like `run_and_report`, but writes the witness as raw rkyv bytes in a
+/// second stdin chunk. The guest reads the `ProgramInput` tag from the
+/// first chunk and the rkyv witness from the second via `read_vec()`,
+/// then accesses it zero-copy with `rkyv::access_unchecked`.
+async fn run_and_report_rkyv(
+    label: &str,
+    witness: &shared::BatchSepticDedupBatchWitness,
+    elf: &[u8],
+) -> Result<()> {
+    let client = ProverClient::builder().cpu().build().await;
+
+    let tag_bytes = borsh::to_vec(&shared::ProgramInput::BatchSepticDedupRkyv)
+        .expect("borsh serialize rkyv tag");
+    let rkyv_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(witness)
+        .expect("rkyv serialize witness");
+    let rkyv_len = rkyv_bytes.len();
+    let total_input = tag_bytes.len() + rkyv_len;
+
+    let mut stdin = SP1Stdin::new();
+    stdin.write_vec(tag_bytes);
+    stdin.write_slice(rkyv_bytes.as_ref());
+
+    println!("\n============================================================");
+    println!("  Profiling: {label}");
+    println!("============================================================");
+    println!(
+        "  input_size:         {total_input} bytes (1 B borsh tag + {rkyv_len} B rkyv witness)"
+    );
+
+    let (public_values, report) = client
+        .execute(Elf::from(elf), stdin)
+        .await
+        .map_err(|e| anyhow::anyhow!("execution failed: {e}"))?;
+
+    let output: ProofOutput =
+        borsh::from_slice(public_values.as_slice()).expect("borsh deserialize public output");
+
+    let total = report.total_instruction_count() + report.total_syscall_count();
+    let gas_opt = report.gas();
+    println!("  proof_type:         {}", output.proof_type);
+    println!("  total_instructions: {}", report.total_instruction_count());
+    println!("  total_syscalls:     {}", report.total_syscall_count());
+    println!("  total_cycles:       {total}");
+    if let Some(gas) = gas_opt {
+        let gas_per_cycle = gas as f64 / total as f64;
+        println!("  gas (normalized):   {gas}  ({gas_per_cycle:.3} gas/cycle)");
+    }
+    println!("  touched_memory:     {}", report.touched_memory_addresses);
+
+    if !report.cycle_tracker.is_empty() {
+        println!("\n  Cycle tracker breakdown:");
+        let header_gas = if gas_opt.is_some() { "gas (est.)" } else { "" };
+        println!(
+            "    {:<30} {:>12} {:>14} {:>7}",
+            "section", "cycles", header_gas, "%"
+        );
+        let mut entries: Vec<_> = report.cycle_tracker.iter().collect();
+        entries.sort_by_key(|(_, v)| std::cmp::Reverse(**v));
+        for (name, cycles) in entries {
+            let pct = (*cycles as f64 / total as f64) * 100.0;
+            let gas_est_str = match gas_opt {
+                Some(total_gas) => {
+                    let est = (*cycles as u128 * total_gas as u128 / total as u128) as u64;
+                    format!("{est}")
+                }
+                None => String::new(),
+            };
+            println!("    {name:<30} {cycles:>12} {gas_est_str:>14} {pct:>6.1}%");
         }
     }
 
@@ -962,11 +1305,158 @@ async fn main() -> Result<()> {
             let input = build_batch_septic_verify_merkle_input(&fix, &app, 6000);
             run_and_report("BatchSepticVerifyMerkle (6000 Shamir + Merkle)", input, ELF).await?;
         }
+        Some(s) if s.starts_with("batch-dedup-flat-") => {
+            // Shortcut form: `batch-dedup-flat-<unique>-<orders>`. Tree size
+            // tracks order count so JMT depth is apples-to-apples with the
+            // rkyv/batch modes below. Witness is a `FlatBatchExistenceProof`
+            // (pre-hashed siblings) serialized with rkyv.
+            let (unique_count, count) = parse_unique_orders_suffix(s, "batch-dedup-flat-");
+            let tree_size = count;
+            println!(
+                "\nGenerating flat witness: {} orders, {} unique, {} in JMT...",
+                count, unique_count, tree_size,
+            );
+            let witness = build_batch_septic_dedup_flat_witness(count, unique_count, tree_size);
+            run_and_report_flat_rkyv(
+                &format!(
+                    "BatchSepticDedupFlat ({} orders, {} unique in batch, {} in JMT)",
+                    count, unique_count, tree_size,
+                ),
+                &witness,
+                ELF,
+            )
+            .await?;
+        }
+        Some(s) if s.starts_with("batch-dedup-rkyv-") => {
+            // Shortcut form: `batch-dedup-rkyv-<unique>-<orders>`. Alias of
+            // `batch-septic-dedup-rkyv-<orders>` with unique-count baked in.
+            let (unique_count, count) = parse_unique_orders_suffix(s, "batch-dedup-rkyv-");
+            let tree_size = count;
+            println!(
+                "\nGenerating rkyv witness: {} orders, {} unique, {} in JMT...",
+                count, unique_count, tree_size,
+            );
+            let witness =
+                build_batch_septic_dedup_batch_witness(count, unique_count, tree_size);
+            run_and_report_rkyv(
+                &format!(
+                    "BatchSepticDedupRkyv ({} orders, {} unique in batch, {} in JMT)",
+                    count, unique_count, tree_size,
+                ),
+                &witness,
+                ELF,
+            )
+            .await?;
+        }
+        Some(s) if s.starts_with("batch-dedup-batch-") => {
+            // Shortcut form: `batch-dedup-batch-<unique>-<orders>`. Alias of
+            // `batch-septic-dedup-batch-<orders>` — borsh-wire BatchExistence.
+            let (unique_count, count) = parse_unique_orders_suffix(s, "batch-dedup-batch-");
+            let tree_size = count;
+            println!(
+                "\nGenerating BatchExistence+borsh witness: {} orders, {} unique, {} in JMT...",
+                count, unique_count, tree_size,
+            );
+            let input = build_batch_septic_dedup_batch_input(count, unique_count, tree_size);
+            run_and_report(
+                &format!(
+                    "BatchSepticDedupBatch ({} orders, {} unique in batch, {} in JMT)",
+                    count, unique_count, tree_size,
+                ),
+                input,
+                ELF,
+            )
+            .await?;
+        }
+        Some(s) if s.starts_with("batch-septic-dedup-rkyv-") => {
+            // Same args as `batch-septic-dedup-batch-<count>` but the witness
+            // travels to the guest as raw rkyv bytes (second stdin chunk) and
+            // is accessed zero-copy — no borsh deserialization.
+            let count: usize = s
+                .trim_start_matches("batch-septic-dedup-rkyv-")
+                .parse()
+                .expect("expected batch-septic-dedup-rkyv-<count>");
+            let ratio: f64 = args
+                .get(2)
+                .map(|s| s.parse().expect("ratio must be a number in [0, 1]"))
+                .unwrap_or(0.2);
+            assert!((0.0..=1.0).contains(&ratio), "ratio must be in [0, 1]");
+            let unique_count = (((count as f64) * (1.0 - ratio)).ceil() as usize).max(1);
+            let tree_size: usize = args
+                .get(3)
+                .map(|s| s.parse().expect("tree_size must be a positive int"))
+                .unwrap_or(unique_count);
+            assert!(
+                tree_size >= unique_count,
+                "tree_size ({}) must be >= unique_count ({})",
+                tree_size,
+                unique_count
+            );
+            println!(
+                "\nGenerating {} septic witnesses via rkyv zero-copy (unique={}, JMT size={})...",
+                count, unique_count, tree_size
+            );
+            let witness =
+                build_batch_septic_dedup_batch_witness(count, unique_count, tree_size);
+            run_and_report_rkyv(
+                &format!(
+                    "BatchSepticDedupRkyv ({} orders, {} unique in batch, {} in JMT)",
+                    count, unique_count, tree_size
+                ),
+                &witness,
+                ELF,
+            )
+            .await?;
+        }
+        Some(s) if s.starts_with("batch-septic-dedup-batch-") => {
+            // Same args as `batch-septic-dedup-<count>` but uses
+            // `BatchExistenceProof` (one JMT verify, cached hashes).
+            //   batch-septic-dedup-batch-6000 0.9667 6000  → 6000 orders,
+            //   ~200 unique keys, JMT holds 6000 keys.
+            let count: usize = s
+                .trim_start_matches("batch-septic-dedup-batch-")
+                .parse()
+                .expect("expected batch-septic-dedup-batch-<count>");
+            let ratio: f64 = args
+                .get(2)
+                .map(|s| s.parse().expect("ratio must be a number in [0, 1]"))
+                .unwrap_or(0.2);
+            assert!((0.0..=1.0).contains(&ratio), "ratio must be in [0, 1]");
+            let unique_count = (((count as f64) * (1.0 - ratio)).ceil() as usize).max(1);
+            let tree_size: usize = args
+                .get(3)
+                .map(|s| s.parse().expect("tree_size must be a positive int"))
+                .unwrap_or(unique_count);
+            assert!(
+                tree_size >= unique_count,
+                "tree_size ({}) must be >= unique_count ({})",
+                tree_size,
+                unique_count
+            );
+            println!(
+                "\nGenerating {} septic witnesses via BatchExistenceProof (unique={}, JMT size={})...",
+                count, unique_count, tree_size
+            );
+            let input = build_batch_septic_dedup_batch_input(count, unique_count, tree_size);
+            run_and_report(
+                &format!(
+                    "BatchSepticDedupBatch ({} orders, {} unique in batch, {} in JMT)",
+                    count, unique_count, tree_size
+                ),
+                input,
+                ELF,
+            )
+            .await?;
+        }
         Some(s) if s.starts_with("batch-septic-dedup-") => {
-            // Mode form: `batch-septic-dedup-<count>` with optional second arg
-            // = repetition ratio in [0, 1] (default 0.2). Examples:
-            //   batch-septic-dedup-6000          → 6000 orders, 20% repeat
-            //   batch-septic-dedup-6000 0.5      → 6000 orders, 50% repeat
+            // Mode form: `batch-septic-dedup-<count> [ratio] [tree_size]`
+            //   batch-septic-dedup-6000              → 6000 orders, 20% repeat,
+            //                                          tree_size = unique_count
+            //   batch-septic-dedup-6000 0.5          → 6000 orders, 50% repeat,
+            //                                          tree_size = unique_count
+            //   batch-septic-dedup-6000 0.9667 6000  → 6000 orders, ~200 unique
+            //                                          keys in batch, JMT holds
+            //                                          6000 keys (depth ~13)
             let count: usize = s
                 .trim_start_matches("batch-septic-dedup-")
                 .parse()
@@ -975,17 +1465,27 @@ async fn main() -> Result<()> {
                 .get(2)
                 .map(|s| s.parse().expect("ratio must be a number in [0, 1]"))
                 .unwrap_or(0.2);
-            println!(
-                "\nGenerating {} deduped septic witnesses ({:.0}% repetition)...",
-                count,
-                ratio * 100.0
+            assert!((0.0..=1.0).contains(&ratio), "ratio must be in [0, 1]");
+            let unique_count = (((count as f64) * (1.0 - ratio)).ceil() as usize).max(1);
+            let tree_size: usize = args
+                .get(3)
+                .map(|s| s.parse().expect("tree_size must be a positive int"))
+                .unwrap_or(unique_count);
+            assert!(
+                tree_size >= unique_count,
+                "tree_size ({}) must be >= unique_count ({})",
+                tree_size,
+                unique_count
             );
-            let input = build_batch_septic_dedup_input(count, ratio);
+            println!(
+                "\nGenerating {} septic witnesses (batch unique={}, JMT size={})...",
+                count, unique_count, tree_size
+            );
+            let input = build_batch_septic_dedup_input(count, unique_count, tree_size);
             run_and_report(
                 &format!(
-                    "BatchSepticDedup ({} orders, {:.0}% repeat)",
-                    count,
-                    ratio * 100.0
+                    "BatchSepticDedup ({} orders, {} unique in batch, {} in JMT)",
+                    count, unique_count, tree_size
                 ),
                 input,
                 ELF,
