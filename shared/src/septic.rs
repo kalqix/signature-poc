@@ -9,6 +9,7 @@
 //! codebase (derived from digits of sqrt(2)) and r·G = O is asserted in tests.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 // ─── KoalaBear base field ───────────────────────────────────────────────────
 
@@ -507,6 +508,159 @@ pub fn scalar_mul_mod_r(a: &[u32; 8], b: &[u32; 8]) -> [u32; 8] {
     reduce_512_mod_r(&product)
 }
 
+// ─── Schnorr sign / verify (host-side) ──────────────────────────────────────
+//
+// Host-only signing: `random_scalar` needs OsRng, unavailable in the zkvm.
+// `schnorr_sign` and `schnorr_verify` themselves compile on either target but
+// the guest verifies via the `SEPTIC_VERIFY` precompile
+// (`sp1_lib::septic::schnorr_compute`) for speed — so these are intended as
+// the single source of truth for *backend* signing/verification.
+
+/// Convert a 32-byte big-endian SHA-256 digest to a scalar mod GROUP_ORDER.
+/// Matches `BigUint::from_bytes_be(&hash) % r` byte-for-byte.
+pub fn be_hash_to_scalar_mod_r(hash: &[u8; 32]) -> [u32; 8] {
+    let mut limbs = [0u32; 8];
+    for i in 0..8 {
+        let start = (7 - i) * 4;
+        limbs[i] = u32::from_be_bytes([
+            hash[start],
+            hash[start + 1],
+            hash[start + 2],
+            hash[start + 3],
+        ]);
+    }
+    let mut padded = [0u32; 16];
+    padded[..8].copy_from_slice(&limbs);
+    reduce_512_mod_r(&padded)
+}
+
+/// Schnorr challenge: `e = SHA256(R.x || A.x || msg_hash) mod GROUP_ORDER`.
+pub fn schnorr_challenge(
+    r_point: &SepticPoint,
+    pubkey: &SepticPoint,
+    msg_hash: &[u8; 32],
+) -> [u32; 8] {
+    let mut h = Sha256::new();
+    h.update(r_point.x.to_bytes());
+    h.update(pubkey.x.to_bytes());
+    h.update(msg_hash);
+    let e_hash: [u8; 32] = h.finalize().into();
+    be_hash_to_scalar_mod_r(&e_hash)
+}
+
+/// Schnorr-sign `msg_hash` with private scalar `priv_limbs` and nonce `k_limbs`.
+///
+/// Returns `(R.x, R.y, s, e)` where `R = k·G`, `s = k − e·a (mod r)`, and
+/// `e = SHA256(R.x ‖ A.x ‖ msg_hash) mod r`.
+///
+/// The caller is responsible for:
+///   - Generating `k_limbs` uniformly in `[1, r − 1]` (e.g. via `random_scalar`).
+///   - Passing `msg_hash = SHA256(message_bytes)`.
+pub fn schnorr_sign(
+    priv_limbs: &[u32; 8],
+    pubkey: &SepticPoint,
+    k_limbs: &[u32; 8],
+    msg_hash: &[u8; 32],
+) -> ([u32; 7], [u32; 7], [u32; 8], [u32; 8]) {
+    let g = SepticPoint::generator();
+    let r_point = g.scalar_mul(k_limbs);
+
+    let e_limbs = schnorr_challenge(&r_point, pubkey, msg_hash);
+
+    let ea = scalar_mul_mod_r(&e_limbs, priv_limbs);
+    let s_limbs = scalar_sub(k_limbs, &ea);
+
+    debug_assert!(
+        {
+            let s_g = g.scalar_mul(&s_limbs);
+            let e_a = pubkey.scalar_mul(&e_limbs);
+            let check = s_g.add(&e_a);
+            !check.is_infinity && check.x == r_point.x && check.y == r_point.y
+        },
+        "schnorr_sign self-check failed (s·G + e·A != R)"
+    );
+
+    (r_point.x.0, r_point.y.0, s_limbs, e_limbs)
+}
+
+/// Verify a septic Schnorr signature: re-derive `e` and check `s·G + e·A = R`.
+///
+/// Both the challenge binding (`e_recomputed == e`) and the curve check must
+/// hold; either failure returns `false`.
+pub fn schnorr_verify(
+    pubkey: &SepticPoint,
+    msg_hash: &[u8; 32],
+    r_x: &[u32; 7],
+    r_y: &[u32; 7],
+    s: &[u32; 8],
+    e: &[u32; 8],
+) -> bool {
+    let r_point = SepticPoint::new(Fp7(*r_x), Fp7(*r_y));
+
+    let e_computed = schnorr_challenge(&r_point, pubkey, msg_hash);
+    if e_computed != *e {
+        return false;
+    }
+
+    let g = SepticPoint::generator();
+    let s_g = g.scalar_mul(s);
+    let e_a = pubkey.scalar_mul(e);
+    let check = s_g.add(&e_a);
+
+    !check.is_infinity && check.x == r_point.x && check.y == r_point.y
+}
+
+/// Verify a `SignedOrder` against the registered pubkey, using the canonical
+/// `septic_order_message` to derive `msg_hash`. The pubkey is supplied by the
+/// caller (typically from the JMT-verified session-key leaf).
+pub fn verify_signed_order(
+    pubkey_x: &[u32; 7],
+    pubkey_y: &[u32; 7],
+    order: &super::SignedOrder,
+) -> bool {
+    let pubkey = SepticPoint::new(Fp7(*pubkey_x), Fp7(*pubkey_y));
+    let msg = super::septic_order_message(order);
+    let msg_hash: [u8; 32] = Sha256::digest(msg.as_bytes()).into();
+    schnorr_verify(
+        &pubkey,
+        &msg_hash,
+        &order.signature_r_x,
+        &order.signature_r_y,
+        &order.signature_s,
+        &order.challenge_e,
+    )
+}
+
+/// Generate a uniformly random nonzero scalar in `[1, GROUP_ORDER − 1]`.
+///
+/// Reads 32 bytes from `OsRng`, interprets them as little-endian u32 limbs,
+/// and reduces mod `r`. Rejects the (vanishingly rare) zero case. Host-only:
+/// the guest never generates randomness.
+#[cfg(not(target_os = "zkvm"))]
+pub fn random_scalar() -> [u32; 8] {
+    use rand::RngCore;
+    let mut rng = rand::rngs::OsRng;
+    loop {
+        let mut bytes = [0u8; 32];
+        rng.fill_bytes(&mut bytes);
+        let mut limbs = [0u32; 8];
+        for i in 0..8 {
+            limbs[i] = u32::from_le_bytes([
+                bytes[i * 4],
+                bytes[i * 4 + 1],
+                bytes[i * 4 + 2],
+                bytes[i * 4 + 3],
+            ]);
+        }
+        let mut padded = [0u32; 16];
+        padded[..8].copy_from_slice(&limbs);
+        let reduced = reduce_512_mod_r(&padded);
+        if reduced != [0u32; 8] {
+            return reduced;
+        }
+    }
+}
+
 // ─── Schnorr types ──────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize)]
@@ -741,5 +895,155 @@ mod tests {
         // Square of an almost-r-sized scalar definitely needs reduction.
         let result = scalar_mul_mod_r(&a, &a);
         assert!(!u256_gte(&result, &GROUP_ORDER), "result must be < r");
+    }
+}
+
+#[cfg(test)]
+mod sign_verify_tests {
+    use super::*;
+
+    fn deterministic_keypair(seed: u32) -> ([u32; 8], SepticPoint) {
+        let mut limbs = [0u32; 8];
+        limbs[0] = seed;
+        limbs[1] = seed.wrapping_mul(31337);
+        let mut padded = [0u32; 16];
+        padded[..8].copy_from_slice(&limbs);
+        let priv_limbs = reduce_512_mod_r(&padded);
+        let pubkey = SepticPoint::generator().scalar_mul(&priv_limbs);
+        (priv_limbs, pubkey)
+    }
+
+    fn deterministic_nonce(seed: &[u8]) -> [u32; 8] {
+        let hash: [u8; 32] = Sha256::digest(seed).into();
+        be_hash_to_scalar_mod_r(&hash)
+    }
+
+    #[test]
+    fn test_sign_verify_roundtrip() {
+        let (priv_limbs, pubkey) = deterministic_keypair(42);
+        let msg_hash: [u8; 32] =
+            Sha256::digest(b"ETH/USDC:BUY:2000000:100:abcdef").into();
+        let k = deterministic_nonce(b"test_nonce_42");
+
+        let (r_x, r_y, s, e) = schnorr_sign(&priv_limbs, &pubkey, &k, &msg_hash);
+        assert!(schnorr_verify(&pubkey, &msg_hash, &r_x, &r_y, &s, &e));
+    }
+
+    #[test]
+    fn test_verify_wrong_message_fails() {
+        let (priv_limbs, pubkey) = deterministic_keypair(42);
+        let msg_hash: [u8; 32] = Sha256::digest(b"correct").into();
+        let k = deterministic_nonce(b"nonce");
+
+        let (r_x, r_y, s, e) = schnorr_sign(&priv_limbs, &pubkey, &k, &msg_hash);
+
+        let wrong_hash: [u8; 32] = Sha256::digest(b"wrong").into();
+        assert!(!schnorr_verify(&pubkey, &wrong_hash, &r_x, &r_y, &s, &e));
+    }
+
+    #[test]
+    fn test_verify_wrong_key_fails() {
+        let (priv_limbs, pubkey) = deterministic_keypair(42);
+        let msg_hash: [u8; 32] = Sha256::digest(b"message").into();
+        let k = deterministic_nonce(b"nonce");
+
+        let (r_x, r_y, s, e) = schnorr_sign(&priv_limbs, &pubkey, &k, &msg_hash);
+
+        let (_, wrong_pubkey) = deterministic_keypair(999);
+        assert!(!schnorr_verify(&wrong_pubkey, &msg_hash, &r_x, &r_y, &s, &e));
+    }
+
+    #[test]
+    fn test_verify_tampered_s_fails() {
+        let (priv_limbs, pubkey) = deterministic_keypair(42);
+        let msg_hash: [u8; 32] = Sha256::digest(b"message").into();
+        let k = deterministic_nonce(b"nonce");
+
+        let (r_x, r_y, mut s, e) = schnorr_sign(&priv_limbs, &pubkey, &k, &msg_hash);
+        s[0] ^= 1;
+        assert!(!schnorr_verify(&pubkey, &msg_hash, &r_x, &r_y, &s, &e));
+    }
+
+    #[test]
+    fn test_be_hash_to_scalar_matches_bigint() {
+        // be_hash_to_scalar_mod_r must agree with BigUint::from_bytes_be % r,
+        // the convention previously used by profile.rs. If this drifts, all
+        // pre-existing signatures from the BigUint path stop verifying.
+        let hash: [u8; 32] = Sha256::digest(b"alignment test").into();
+        let our_result = be_hash_to_scalar_mod_r(&hash);
+
+        let r = num_bigint::BigUint::parse_bytes(
+            b"199372529839252601278447397890876471698671718266839763841250021879",
+            10,
+        )
+        .unwrap();
+        let big = num_bigint::BigUint::from_bytes_be(&hash);
+        let reduced = &big % &r;
+        let digits = reduced.to_u32_digits();
+        let mut expected = [0u32; 8];
+        for (i, &d) in digits.iter().enumerate().take(8) {
+            expected[i] = d;
+        }
+        assert_eq!(
+            our_result, expected,
+            "be_hash_to_scalar_mod_r must match BigUint::from_bytes_be % r"
+        );
+    }
+
+    #[test]
+    fn test_sign_self_check() {
+        // Independent re-verification that s·G + e·A == R for a fresh signature
+        // (the same equation the in-fn debug_assert checks). Catches any
+        // regression where sign generates a signature its own verify rejects.
+        let (priv_limbs, pubkey) = deterministic_keypair(12345);
+        let msg_hash: [u8; 32] =
+            Sha256::digest(b"ETH/USDC:BUY:3000:50:deadbeef").into();
+        let k = deterministic_nonce(b"deterministic_k_for_test");
+
+        let (r_x, r_y, s, e) = schnorr_sign(&priv_limbs, &pubkey, &k, &msg_hash);
+
+        let g = SepticPoint::generator();
+        let s_g = g.scalar_mul(&s);
+        let e_a = pubkey.scalar_mul(&e);
+        let check = s_g.add(&e_a);
+        assert!(!check.is_infinity);
+        assert_eq!(check.x.0, r_x, "s·G + e·A x-coordinate must equal R.x");
+        assert_eq!(check.y.0, r_y, "s·G + e·A y-coordinate must equal R.y");
+    }
+
+    #[test]
+    fn test_verify_signed_order_roundtrip() {
+        // verify_signed_order is the production entry point: build a real
+        // SignedOrder, sign it via shared, then verify it via shared.
+        let (priv_limbs, pubkey) = deterministic_keypair(7);
+        let address: [u8; 20] = [0xAB; 20];
+        let mut order = crate::SignedOrder {
+            account_address: address,
+            key_index: 0,
+            market: "ETH/USDC".to_string(),
+            side: "BUY".to_string(),
+            price: 2_000_000,
+            quantity: 100,
+            signature_r_x: [0u32; 7],
+            signature_r_y: [0u32; 7],
+            signature_s: [0u32; 8],
+            challenge_e: [0u32; 8],
+        };
+        let msg_hash: [u8; 32] =
+            Sha256::digest(crate::septic_order_message(&order).as_bytes()).into();
+        let k = deterministic_nonce(b"signed_order_nonce");
+        let (r_x, r_y, s, e) = schnorr_sign(&priv_limbs, &pubkey, &k, &msg_hash);
+        order.signature_r_x = r_x;
+        order.signature_r_y = r_y;
+        order.signature_s = s;
+        order.challenge_e = e;
+
+        assert!(verify_signed_order(&pubkey.x.0, &pubkey.y.0, &order));
+
+        // Tampering with order fields (price, here) re-hashes to a different
+        // message; signature should no longer verify.
+        let mut tampered = order.clone();
+        tampered.price = 2_000_001;
+        assert!(!verify_signed_order(&pubkey.x.0, &pubkey.y.0, &tampered));
     }
 }

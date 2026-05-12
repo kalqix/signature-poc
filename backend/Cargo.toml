@@ -20,7 +20,4 @@ rkyv = { version = "0.8", features = ["alloc", "bytecheck"] }
 anyhow = "1"
 k256 = { version = "0.13", features = ["ecdsa"] }
 rand = "0.8"
-num-bigint = "0.4"
-num-traits = "0.2"
-num-integer = "0.1"
 jmt = { git = "https://github.com/kalqix/jmt", rev = "4bd0faa76480419b0eda86e13b0d61e27d495f40", default-features = false, features = ["std", "sha2", "mocks"] }

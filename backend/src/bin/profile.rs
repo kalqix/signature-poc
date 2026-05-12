@@ -16,16 +16,15 @@ use std::env;
 
 use anyhow::Result;
 use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey as Secp256k1SigningKey};
-use num_bigint::BigUint;
-use num_traits::Zero;
-use rand::{rngs::OsRng, RngCore};
+use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use tiny_keccak::{Hasher, Keccak};
 
 use sp1_sdk::{Elf, ProverClient, Prover, SP1Stdin};
 
 use shared::septic::{
-    SepticBenchWitness, SepticPoint, SepticSchnorrOrder, SepticSchnorrSignature,
+    random_scalar, schnorr_sign as shared_schnorr_sign, schnorr_verify, SepticBenchWitness,
+    SepticPoint, SepticSchnorrOrder, SepticSchnorrSignature,
 };
 use shared::*;
 
@@ -92,89 +91,69 @@ fn eth_sign(sk: &Secp256k1SigningKey, digest: &[u8; 32]) -> String {
     hex::encode(sig_bytes)
 }
 
-// ── Septic Schnorr helpers (host-side scalar arithmetic via num-bigint) ────
+// ── Septic Schnorr helpers (delegate to `shared::septic`) ──────────────────
 
-fn group_order_biguint() -> BigUint {
-    BigUint::parse_bytes(
-        b"199372529839252601278447397890876471698671718266839763841250021879",
-        10,
-    )
-    .unwrap()
-}
-
-fn biguint_to_limbs(n: &BigUint) -> [u32; 8] {
-    let digits = n.to_u32_digits();
-    let mut limbs = [0u32; 8];
-    for (i, &d) in digits.iter().enumerate().take(8) {
-        limbs[i] = d;
-    }
-    limbs
-}
-
-fn random_scalar(r: &BigUint) -> BigUint {
-    let mut rng = OsRng;
-    loop {
-        let mut bytes = [0u8; 32];
-        rng.fill_bytes(&mut bytes);
-        let k = BigUint::from_bytes_le(&bytes) % r;
-        if !k.is_zero() {
-            return k;
-        }
-    }
-}
-
-/// Session-key pair: (private scalar, public point) on the septic curve.
+/// Session-key pair: (private scalar limbs, public point) on the septic curve.
+/// `priv_limbs` are LE u32 limbs of the scalar `a` with `a·G = pubkey`.
 #[derive(Clone)]
 struct SessionPair {
-    priv_scalar: BigUint,
+    priv_limbs: [u32; 8],
     pubkey: SepticPoint,
 }
 
 fn make_session_pair() -> SessionPair {
-    let r = group_order_biguint();
-    let g = SepticPoint::generator();
-    let priv_scalar = random_scalar(&r);
-    let priv_limbs = biguint_to_limbs(&priv_scalar);
-    let pubkey = g.scalar_mul(&priv_limbs);
+    let priv_limbs = random_scalar();
+    let pubkey = SepticPoint::generator().scalar_mul(&priv_limbs);
     assert!(pubkey.on_curve(), "host-generated pubkey must be on curve");
-    SessionPair { priv_scalar, pubkey }
+    SessionPair { priv_limbs, pubkey }
 }
 
-/// Schnorr-sign `msg_hash` with `session` and return (r_point, s_limbs, e_limbs).
-fn schnorr_sign(session: &SessionPair, msg_hash: &[u8; 32]) -> ([u32; 7], [u32; 7], [u32; 8], [u32; 8]) {
-    let r = group_order_biguint();
-    let g = SepticPoint::generator();
+/// Thin wrapper around `shared::septic::schnorr_sign` — picks a fresh nonce
+/// `k` from `OsRng` so callsites stay short. Keeps the legacy 4-tuple shape
+/// `(R.x, R.y, s, e)` so all existing builders compile unchanged.
+fn schnorr_sign(
+    session: &SessionPair,
+    msg_hash: &[u8; 32],
+) -> ([u32; 7], [u32; 7], [u32; 8], [u32; 8]) {
+    let k_limbs = random_scalar();
+    shared_schnorr_sign(&session.priv_limbs, &session.pubkey, &k_limbs, msg_hash)
+}
 
-    let k = random_scalar(&r);
-    let k_limbs = biguint_to_limbs(&k);
-    let r_point = g.scalar_mul(&k_limbs);
-
-    let mut challenge_input = Vec::with_capacity(28 + 28 + 32);
-    challenge_input.extend_from_slice(&r_point.x.to_bytes());
-    challenge_input.extend_from_slice(&session.pubkey.x.to_bytes());
-    challenge_input.extend_from_slice(msg_hash);
-    let e_hash = Sha256::digest(&challenge_input);
-    let e_biguint = BigUint::from_bytes_be(&e_hash) % &r;
-    let e_limbs = biguint_to_limbs(&e_biguint);
-
-    let ea = (&e_biguint * &session.priv_scalar) % &r;
-    let s_biguint = if k >= ea {
-        (&k - &ea) % &r
-    } else {
-        (&k + &r - &ea) % &r
-    };
-    let s_limbs = biguint_to_limbs(&s_biguint);
-
-    // Host-side sanity: s*G + e*A == R
-    let s_g = g.scalar_mul(&s_limbs);
-    let e_a = session.pubkey.scalar_mul(&e_limbs);
-    let sum = s_g.add(&e_a);
-    assert!(
-        !sum.is_infinity && sum.x == r_point.x && sum.y == r_point.y,
-        "host-side Schnorr self-check failed"
+/// Verify every `DedupOrder` in `orders` against the session it references
+/// (via `key_idx`). Mirrors what a backend handler would do: re-derive the
+/// canonical message, hash it, and call `shared::septic::schnorr_verify`.
+/// Panics on the first failure — this is a correctness gate, not a soft check.
+fn verify_dedup_orders(orders: &[DedupOrder], session_pairs: &[(SessionPair, [u8; 20], u8)]) {
+    use std::time::Instant;
+    let start = Instant::now();
+    for (idx, order) in orders.iter().enumerate() {
+        let (session, address, _key_index) = &session_pairs[order.key_idx as usize];
+        let msg = format!(
+            "{}:{}:{}:{}:{}",
+            order.market,
+            order.side,
+            order.price,
+            order.quantity,
+            hex::encode(address),
+        );
+        let msg_hash: [u8; 32] = Sha256::digest(msg.as_bytes()).into();
+        assert!(
+            schnorr_verify(
+                &session.pubkey,
+                &msg_hash,
+                &order.signature_r_x,
+                &order.signature_r_y,
+                &order.signature_s,
+                &order.challenge_e,
+            ),
+            "backend schnorr_verify failed for order {idx}",
+        );
+    }
+    println!(
+        "  Backend verified {} orders in {:?}",
+        orders.len(),
+        start.elapsed(),
     );
-
-    (r_point.x.0, r_point.y.0, s_limbs, e_limbs)
 }
 
 struct TestFixtures {
@@ -320,13 +299,13 @@ fn build_verify_order_septic_input(fix: &TestFixtures, app: &AppState) -> Progra
 }
 
 fn build_batch_septic_input(fix: &TestFixtures, count: usize) -> ProgramInput {
-    let r = group_order_biguint();
     let g = SepticPoint::generator();
 
     let mut orders = Vec::with_capacity(count);
     for i in 0..count {
-        let a_scalar = random_scalar(&r);
-        let a_limbs = biguint_to_limbs(&a_scalar);
+        // Fresh keypair per order — each order in this batch is signed by a
+        // distinct (a, A) pair to model worst-case zero-dedup.
+        let a_limbs = random_scalar();
         let pubkey = g.scalar_mul(&a_limbs);
 
         let order_msg = format!(
@@ -335,27 +314,11 @@ fn build_batch_septic_input(fix: &TestFixtures, count: usize) -> ProgramInput {
             100 + (i % 50),
             hex::encode(fix.address)
         );
-        let msg_hash = Sha256::digest(order_msg.as_bytes());
+        let msg_hash: [u8; 32] = Sha256::digest(order_msg.as_bytes()).into();
 
-        let k = random_scalar(&r);
-        let k_limbs = biguint_to_limbs(&k);
-        let r_point = g.scalar_mul(&k_limbs);
-
-        let mut challenge_input = Vec::with_capacity(28 + 28 + 32);
-        challenge_input.extend_from_slice(&r_point.x.to_bytes());
-        challenge_input.extend_from_slice(&pubkey.x.to_bytes());
-        challenge_input.extend_from_slice(&msg_hash);
-        let e_hash = Sha256::digest(&challenge_input);
-        let e_biguint = BigUint::from_bytes_be(&e_hash) % &r;
-        let e_limbs = biguint_to_limbs(&e_biguint);
-
-        let ea = (&e_biguint * &a_scalar) % &r;
-        let s_biguint = if k >= ea {
-            (&k - &ea) % &r
-        } else {
-            (&k + &r - &ea) % &r
-        };
-        let s_limbs = biguint_to_limbs(&s_biguint);
+        let k_limbs = random_scalar();
+        let (r_x, r_y, s_limbs, e_limbs) =
+            shared_schnorr_sign(&a_limbs, &pubkey, &k_limbs, &msg_hash);
 
         let order = SepticSchnorrOrder {
             account_address: fix.address,
@@ -365,8 +328,8 @@ fn build_batch_septic_input(fix: &TestFixtures, count: usize) -> ProgramInput {
             price: 2000000 + i as u64,
             quantity: 100 + (i % 50) as u64,
             signature: SepticSchnorrSignature {
-                r_x: r_point.x,
-                r_y: r_point.y,
+                r_x: shared::septic::Fp7(r_x),
+                r_y: shared::septic::Fp7(r_y),
                 s: s_limbs,
             },
             pubkey_x: pubkey.x,
@@ -566,6 +529,12 @@ fn build_batch_septic_dedup_input(
     // Shuffle so reused keys aren't all clustered at the end.
     orders.shuffle(&mut rng);
 
+    // Backend verification: every order must verify against its session's
+    // pubkey via the SAME `shared::septic::schnorr_verify` that production
+    // would call. Catches sign/verify drift before the witness ever reaches
+    // the guest.
+    verify_dedup_orders(&orders, &session_pairs);
+
     ProgramInput::BatchSepticDedup(BatchSepticDedupWitness {
         unique_keys,
         orders,
@@ -716,6 +685,11 @@ fn build_batch_septic_dedup_batch_witness(
     }
     orders.shuffle(&mut rng);
 
+    // Same backend-verification pass as the non-batch dedup builder; the
+    // rkyv/flat paths build on this witness, so verifying here also covers
+    // them transitively.
+    verify_dedup_orders(&orders, &session_pairs);
+
     BatchSepticDedupBatchWitness {
         session_key_root: root.0,
         batch_proof,
@@ -814,6 +788,42 @@ fn build_batch_septic_verify_merkle_input(
         }
     }
 
+    // Backend verification: single session, so loop directly without the
+    // key-index plumbing of `verify_dedup_orders`. Same `schnorr_verify`
+    // entry point production would use.
+    {
+        use std::time::Instant;
+        let start = Instant::now();
+        for (idx, entry) in orders.iter().enumerate() {
+            let o = &entry.bench.order;
+            let msg = format!(
+                "{}:{}:{}:{}:{}",
+                o.market,
+                o.side,
+                o.price,
+                o.quantity,
+                hex::encode(o.account_address),
+            );
+            let msg_hash: [u8; 32] = Sha256::digest(msg.as_bytes()).into();
+            assert!(
+                schnorr_verify(
+                    &fix.session.pubkey,
+                    &msg_hash,
+                    &entry.bench.order.signature.r_x.0,
+                    &entry.bench.order.signature.r_y.0,
+                    &entry.bench.order.signature.s,
+                    &entry.bench.challenge_e,
+                ),
+                "backend schnorr_verify failed for verify-merkle order {idx}",
+            );
+        }
+        println!(
+            "  Backend verified {} orders in {:?}",
+            orders.len(),
+            start.elapsed(),
+        );
+    }
+
     ProgramInput::BatchSepticVerifyMerkle(BatchSepticVerifyMerkleWitness {
         orders,
         session_key_root: proof.root,
@@ -856,10 +866,8 @@ fn bench_signing(fix: &TestFixtures, count: usize) {
     println!("  Host signing benchmark (count = {count}, key generation excluded)");
     println!("============================================================");
 
-    let r = group_order_biguint();
     let g = SepticPoint::generator();
-    let a_scalar = random_scalar(&r);
-    let a_limbs = biguint_to_limbs(&a_scalar);
+    let a_limbs = random_scalar();
     let septic_pubkey = g.scalar_mul(&a_limbs);
 
     let start = Instant::now();
@@ -870,28 +878,12 @@ fn bench_signing(fix: &TestFixtures, count: usize) {
             100 + (i % 50),
             hex::encode(fix.address)
         );
-        let msg_hash = Sha256::digest(order_msg.as_bytes());
+        let msg_hash: [u8; 32] = Sha256::digest(order_msg.as_bytes()).into();
 
-        let k = random_scalar(&r);
-        let k_limbs = biguint_to_limbs(&k);
-        let r_point = g.scalar_mul(&k_limbs);
+        let k_limbs = random_scalar();
+        let sig = shared_schnorr_sign(&a_limbs, &septic_pubkey, &k_limbs, &msg_hash);
 
-        let mut challenge_input = Vec::with_capacity(28 + 28 + 32);
-        challenge_input.extend_from_slice(&r_point.x.to_bytes());
-        challenge_input.extend_from_slice(&septic_pubkey.x.to_bytes());
-        challenge_input.extend_from_slice(&msg_hash);
-        let e_hash = Sha256::digest(&challenge_input);
-        let e_biguint = BigUint::from_bytes_be(&e_hash) % &r;
-
-        let ea = (&e_biguint * &a_scalar) % &r;
-        let _s = if k >= ea {
-            (&k - &ea) % &r
-        } else {
-            (&k + &r - &ea) % &r
-        };
-
-        std::hint::black_box(&r_point);
-        std::hint::black_box(&_s);
+        std::hint::black_box(&sig);
     }
     let septic_total = start.elapsed();
     let septic_per_sig = septic_total / count as u32;

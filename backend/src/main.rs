@@ -153,6 +153,16 @@ async fn place_order(
         }
     };
 
+    // Reject bad signatures at the edge — no point spending guest cycles on
+    // an order whose Schnorr is broken. Pubkey comes from the JMT-verified
+    // session-key leaf, so this also binds the signature to the registered key.
+    if !shared::septic::verify_signed_order(&proof.key.pubkey_x, &proof.key.pubkey_y, &order) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid Schnorr signature"})),
+        );
+    }
+
     let witness = OrderWitness {
         order: order.clone(),
         session_key: proof.key,

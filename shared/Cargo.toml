@@ -18,8 +18,14 @@ jmt = { git = "https://github.com/kalqix/jmt", rev = "4bd0faa76480419b0eda86e13b
 sp1-zkvm = "6.0.2"
 
 # Host-only: software Poseidon2 (must produce byte-identical output to the
-# guest precompile — verified by the alignment test).
+# guest precompile — verified by the alignment test) and OS randomness for
+# Schnorr nonce/key generation.
 [target.'cfg(not(target_os = "zkvm"))'.dependencies]
 sp1-primitives = "6.0.2"
 p3-field = "0.3.2-succinct"
 p3-symmetric = "0.3.2-succinct"
+rand = "0.8"
+
+[dev-dependencies]
+num-bigint = "0.4"
+num-traits = "0.2"

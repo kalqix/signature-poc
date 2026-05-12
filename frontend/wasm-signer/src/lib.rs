@@ -1,54 +1,17 @@
 //! WASM-compiled septic Schnorr signer for the KalqiX frontend.
 //!
-//! Math is re-exported from `shared::septic` — the single source of truth
-//! for Fp7, curve, and 256-bit scalar arithmetic. This crate stays out of
-//! the workspace so it does not inherit SP1 patches (which don't target
-//! wasm32); `shared`'s deps fall back to vanilla crates.io here.
+//! All Schnorr math (sign, verify, scalar generation) lives in
+//! `shared::septic`. This crate is a thin WASM-bindgen shim that converts
+//! JS-friendly `Vec<u32>` payloads to/from the limb-array types `shared`
+//! expects. It stays out of the main workspace so it does not inherit SP1
+//! patches (which don't target wasm32); `shared`'s deps fall back to
+//! vanilla crates.io here.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 
-use shared::septic::{
-    reduce_512_mod_r, scalar_mul_mod_r, scalar_sub, Fp7, SepticPoint,
-};
-
-// ─── Signing helpers (thin wrappers over shared) ────────────────────────────
-
-fn random_scalar_limbs() -> [u32; 8] {
-    use rand::RngCore;
-    let mut rng = rand::rngs::OsRng;
-    loop {
-        let mut bytes = [0u8; 32];
-        rng.fill_bytes(&mut bytes);
-        let mut limbs = [0u32; 8];
-        for i in 0..8 {
-            limbs[i] = u32::from_le_bytes([
-                bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3],
-            ]);
-        }
-        let mut padded = [0u32; 16];
-        padded[..8].copy_from_slice(&limbs);
-        let reduced = reduce_512_mod_r(&padded);
-        if reduced != [0u32; 8] {
-            return reduced;
-        }
-    }
-}
-
-/// Reduce a 32-byte big-endian SHA-256 digest mod GROUP_ORDER.
-fn be_hash_to_scalar_mod_r(hash: &[u8; 32]) -> [u32; 8] {
-    let mut limbs = [0u32; 8];
-    for i in 0..8 {
-        let start = (7 - i) * 4;
-        limbs[i] = u32::from_be_bytes([
-            hash[start], hash[start + 1], hash[start + 2], hash[start + 3],
-        ]);
-    }
-    let mut padded = [0u32; 16];
-    padded[..8].copy_from_slice(&limbs);
-    reduce_512_mod_r(&padded)
-}
+use shared::septic::{random_scalar, schnorr_sign, Fp7, SepticPoint};
 
 // ─── WASM types ─────────────────────────────────────────────────────────────
 
@@ -75,9 +38,8 @@ struct SignatureJs {
 /// Returns `{ priv_limbs: [u32; 8], pub_x: [u32; 7], pub_y: [u32; 7] }`.
 #[wasm_bindgen]
 pub fn generate_keypair() -> Result<JsValue, JsValue> {
-    let priv_limbs = random_scalar_limbs();
-    let g = SepticPoint::generator();
-    let pubkey = g.scalar_mul(&priv_limbs);
+    let priv_limbs = random_scalar();
+    let pubkey = SepticPoint::generator().scalar_mul(&priv_limbs);
 
     let kp = KeyPairJs {
         priv_limbs: priv_limbs.to_vec(),
@@ -89,7 +51,7 @@ pub fn generate_keypair() -> Result<JsValue, JsValue> {
 
 /// Sign `message` with a septic Schnorr key.
 ///
-/// Matches `build_verify_order_septic_input` in `backend/src/bin/profile.rs`:
+/// Hash convention matches `shared::septic_order_message` / backend verify:
 /// 1. `msg_hash = SHA256(message)`
 /// 2. `k = random scalar in [1, r-1]`, `R = k·G`
 /// 3. `e = SHA256(R_x || A_x || msg_hash) mod r`
@@ -116,28 +78,14 @@ pub fn sign_order(
     py.copy_from_slice(&pub_y);
 
     let pubkey = SepticPoint::new(Fp7(px), Fp7(py));
-    let g = SepticPoint::generator();
+    let msg_hash: [u8; 32] = Sha256::digest(message.as_bytes()).into();
+    let k_limbs = random_scalar();
 
-    let mut h = Sha256::new();
-    h.update(message.as_bytes());
-    let msg_hash: [u8; 32] = h.finalize().into();
-
-    let k_limbs = random_scalar_limbs();
-    let r_point = g.scalar_mul(&k_limbs);
-
-    let mut h = Sha256::new();
-    h.update(r_point.x.to_bytes());
-    h.update(pubkey.x.to_bytes());
-    h.update(msg_hash);
-    let e_hash: [u8; 32] = h.finalize().into();
-    let e_limbs = be_hash_to_scalar_mod_r(&e_hash);
-
-    let ea = scalar_mul_mod_r(&e_limbs, &a_limbs);
-    let s_limbs = scalar_sub(&k_limbs, &ea);
+    let (r_x, r_y, s_limbs, e_limbs) = schnorr_sign(&a_limbs, &pubkey, &k_limbs, &msg_hash);
 
     let sig = SignatureJs {
-        r_x: r_point.x.0.to_vec(),
-        r_y: r_point.y.0.to_vec(),
+        r_x: r_x.to_vec(),
+        r_y: r_y.to_vec(),
         s: s_limbs.to_vec(),
         challenge_e: e_limbs.to_vec(),
         pubkey_x: pubkey.x.0.to_vec(),
@@ -151,7 +99,7 @@ pub fn sign_order(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::septic::GROUP_ORDER;
+    use shared::septic::{schnorr_verify, GROUP_ORDER};
 
     #[test]
     fn test_generator_on_curve() {
@@ -165,34 +113,18 @@ mod tests {
         assert!(result.is_infinity, "r·G must be point at infinity");
     }
 
-    /// Schnorr self-check: s·G + e·A == R.
+    /// End-to-end: shared::schnorr_sign output verifies via shared::schnorr_verify.
     #[test]
-    fn test_schnorr_self_verify() {
+    fn test_sign_verify_roundtrip_via_shared() {
         let g = SepticPoint::generator();
-        let a_limbs = random_scalar_limbs();
+        let a_limbs = random_scalar();
         let pubkey = g.scalar_mul(&a_limbs);
 
         let msg = "ETH/USDC:BUY:2000000:100:ab123456789abcdef0112233445566778899aaef";
-        let mut h = Sha256::new();
-        h.update(msg.as_bytes());
-        let msg_hash: [u8; 32] = h.finalize().into();
+        let msg_hash: [u8; 32] = Sha256::digest(msg.as_bytes()).into();
+        let k_limbs = random_scalar();
 
-        let k_limbs = random_scalar_limbs();
-        let r_point = g.scalar_mul(&k_limbs);
-
-        let mut h = Sha256::new();
-        h.update(r_point.x.to_bytes());
-        h.update(pubkey.x.to_bytes());
-        h.update(msg_hash);
-        let e_hash: [u8; 32] = h.finalize().into();
-        let e_limbs = be_hash_to_scalar_mod_r(&e_hash);
-
-        let ea = scalar_mul_mod_r(&e_limbs, &a_limbs);
-        let s_limbs = scalar_sub(&k_limbs, &ea);
-
-        let s_g = g.scalar_mul(&s_limbs);
-        let e_a = pubkey.scalar_mul(&e_limbs);
-        let sum = s_g.add(&e_a);
-        assert!(!sum.is_infinity && sum.x == r_point.x && sum.y == r_point.y);
+        let (r_x, r_y, s, e) = schnorr_sign(&a_limbs, &pubkey, &k_limbs, &msg_hash);
+        assert!(schnorr_verify(&pubkey, &msg_hash, &r_x, &r_y, &s, &e));
     }
 }
